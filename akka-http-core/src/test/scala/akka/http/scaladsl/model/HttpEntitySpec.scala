@@ -7,24 +7,24 @@ package akka.http.scaladsl.model
 import java.util.concurrent.TimeoutException
 
 import akka.NotUsed
-import com.typesafe.config.{ Config, ConfigFactory }
-
-import scala.concurrent.{ Await, Promise }
-import scala.concurrent.duration._
-import org.scalatest.{ BeforeAndAfterAll, FreeSpec, MustMatchers }
-import org.scalatest.matchers.{ MatchResult, Matcher }
-import akka.util.ByteString
 import akka.actor.ActorSystem
-import akka.stream.scaladsl._
-import akka.stream.ActorMaterializer
+import akka.http.impl.util._
 import akka.http.scaladsl.model.HttpEntity._
-import akka.http.impl.util.StreamUtils
+import akka.http.scaladsl.model.headers.RawHeader
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl._
 import akka.testkit._
-import org.scalatest.concurrent.ScalaFutures
+import akka.util.ByteString
+import com.typesafe.config.{ Config, ConfigFactory }
+import org.scalatest.matchers.{ MatchResult, Matcher }
+import org.scalatest.BeforeAndAfterAll
 
-import scala.util.Random
+import scala.concurrent.duration._
+import scala.concurrent.{ Await, Promise }
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.must.Matchers
 
-class HttpEntitySpec extends FreeSpec with MustMatchers with BeforeAndAfterAll {
+class HttpEntitySpec extends AnyFreeSpec with Matchers with BeforeAndAfterAll {
   val tpe: ContentType = ContentTypes.`application/octet-stream`
   val abc = ByteString("abc")
   val de = ByteString("de")
@@ -163,23 +163,33 @@ class HttpEntitySpec extends FreeSpec with MustMatchers with BeforeAndAfterAll {
         Chunked(tpe, source(Chunk(abc), Chunk(fgh), Chunk(ijk), LastChunk, LastChunk)) must
           transformTo(Strict(tpe, doubleChars("abcfghijk") ++ trailer))
       }
+      "Chunked with LastChunk with trailer header" in {
+        Chunked(tpe, source(Chunk(abc), Chunk(fgh), Chunk(ijk), LastChunk("", RawHeader("Foo", "pip apo") :: Nil))) must
+          transformTo(Strict(tpe, doubleChars("abcfghijk") ++ trailer))
+      }
+      "Chunked with LastChunk with trailer header keep header chunk" in {
+        val entity = Chunked(tpe, source(Chunk(abc), Chunk(fgh), Chunk(ijk), LastChunk("", RawHeader("Foo", "pip apo") :: Nil)))
+        val transformed = entity.transformDataBytes(duplicateBytesTransformer())
+        val parts = transformed.chunks.runWith(Sink.seq).awaitResult(100.millis)
+
+        parts.map(_.data).reduce(_ ++ _) mustEqual doubleChars("abcfghijk") ++ trailer
+
+        val lastPart = parts.last
+        lastPart.isLastChunk mustBe (true)
+        lastPart mustBe a[LastChunk]
+        lastPart.asInstanceOf[LastChunk].trailer mustEqual (RawHeader("Foo", "pip apo") :: Nil)
+      }
     }
     "support toString" - {
       "Strict with binary MediaType" in {
         val binaryType = ContentTypes.`application/octet-stream`
         val entity = Strict(binaryType, abc)
-        entity must renderStrictDataAs(entity.data.toString())
+        entity must renderStrictDataAs("3 bytes total")
       }
-      "Strict with non-binary MediaType and less than 4096 bytes" in {
+      "Strict with non-binary MediaType" in {
         val nonBinaryType = ContentTypes.`application/json`
         val entity = Strict(nonBinaryType, abc)
-        entity must renderStrictDataAs(entity.data.decodeString(nonBinaryType.charset.value))
-      }
-      "Strict with non-binary MediaType and over 4096 bytes" in {
-        val utf8Type = ContentTypes.`text/plain(UTF-8)`
-        val longString = Random.alphanumeric.take(10000).mkString
-        val entity = Strict(utf8Type, ByteString.apply(longString, utf8Type.charset.value))
-        entity must renderStrictDataAs(s"${longString.take(4095)} ... (10000 bytes total)")
+        entity must renderStrictDataAs("3 bytes total")
       }
       "Default" in {
         val entity = Default(tpe, 11, source(abc, de, fgh, ijk))

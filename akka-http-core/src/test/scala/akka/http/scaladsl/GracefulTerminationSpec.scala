@@ -12,39 +12,34 @@ import akka.http.impl.util._
 import akka.http.scaladsl.model.HttpEntity._
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Connection
+import akka.http.scaladsl.settings.ClientConnectionSettings
 import akka.http.scaladsl.settings.{ ConnectionPoolSettings, ServerSettings }
 import akka.stream.scaladsl._
 import akka.stream.{ Server => _, _ }
 import akka.testkit._
-import com.typesafe.config.{ Config, ConfigFactory }
+import akka.util.ByteString
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import com.typesafe.sslconfig.ssl.{ SSLConfigSettings, SSLLooseConfig }
 import org.scalactic.Tolerance
-import org.scalatest.concurrent.{ Eventually, ScalaFutures }
-import org.scalatest.{ Assertion, BeforeAndAfterAll, Matchers, WordSpec }
+import org.scalatest.concurrent.Eventually
+import org.scalatest.Assertion
 
 import scala.concurrent.duration._
 import scala.concurrent.{ Await, Future, Promise }
+import scala.util.Failure
 import scala.util.Success
 
-class GracefulTerminationSpec extends WordSpec with Matchers with BeforeAndAfterAll with ScalaFutures
-  with WithLogCapturing
-  with Tolerance with Eventually {
-  val testConf: Config = ConfigFactory.parseString(
-    """
-    akka.loglevel = DEBUG
-    akka.loggers = ["akka.http.impl.util.SilenceAllTestEventListener"]
-    akka.stdout-loglevel = DEBUG
+class GracefulTerminationSpec
+  extends AkkaSpecWithMaterializer("""
     windows-connection-abort-workaround-enabled = auto
     akka.http.server.request-timeout = infinite
     akka.http.server.log-unencrypted-network-bytes = 200
     akka.http.client.log-unencrypted-network-bytes = 200
                                                    """)
-  implicit val system = ActorSystem(getClass.getSimpleName, testConf)
-  implicit val materializer = ActorMaterializer()
-  implicit val dispatcher = system.dispatcher
+  with Tolerance with Eventually {
+  implicit lazy val dispatcher = system.dispatcher
 
-  implicit val patience = PatienceConfig(5.seconds.dilated, 200.millis)
+  implicit override val patience = PatienceConfig(5.seconds.dilated(system), 200.millis)
 
   "Graceful termination" should {
 
@@ -121,6 +116,25 @@ class GracefulTerminationSpec extends WordSpec with Matchers with BeforeAndAfter
     }
 
     "in-flight request responses should include Connection: close and connection should be closed" in new TestSetup {
+      override val basePoolSettings: ConnectionPoolSettings =
+        super.basePoolSettings
+          .withTransport(new ClientTransport {
+            override def connectTo(host: String, port: Int, settings: ClientConnectionSettings)(implicit system: ActorSystem): Flow[ByteString, ByteString, Future[Http.OutgoingConnection]] = {
+              ClientTransport.TCP.connectTo(host, port, settings)
+                .mapMaterializedValue { conn =>
+                  val result = Promise[Http.OutgoingConnection]()
+                  conn.onComplete {
+                    case Success(s) => result.trySuccess(s)
+                    case Failure(ex) =>
+                      log.debug(s"Delaying failure ${ex.getMessage}")
+                      system.scheduler.scheduleOnce(100.millis)(result.tryFailure(ex))
+                  }
+                  result.future
+                }
+            }
+          })
+          .withMaxRetries(0) // disable retries for this test since they will be extra slow because we delay failures each by 100ms
+
       val r1 = makeRequest() // establish connection
       val time: FiniteDuration = 3.seconds
 
@@ -142,14 +156,11 @@ class GracefulTerminationSpec extends WordSpec with Matchers with BeforeAndAfter
     "allow configuring the automatic termination response (in config)" in {
       new TestSetup {
 
-        override def serverSettings: ServerSettings = {
-          val c = ConfigFactory.parseString(
+        override def serverSettings: ServerSettings =
+          ServerSettings(
             """akka.http.server {
-               termination-deadline-exceeded-response.status = 418 # I'm a teapot
-             }""")
-            .withFallback(system.settings.config)
-          ServerSettings(c)
-        }
+                 termination-deadline-exceeded-response.status = 418 # I'm a teapot
+               }""")
 
         val r1 = makeRequest() // establish connection
         val time: FiniteDuration = 1.seconds
@@ -191,10 +202,6 @@ class GracefulTerminationSpec extends WordSpec with Matchers with BeforeAndAfter
 
   private def ensureConnectionIsClosed(r: Future[HttpResponse]): Assertion =
     (the[StreamTcpException] thrownBy Await.result(r, 1.second)).getMessage should endWith("Connection refused")
-
-  override def afterAll() = {
-    TestKit.shutdownActorSystem(system)
-  }
 
   class TestSetup(overrideResponse: Option[HttpResponse] = None) {
     val (hostname, port) = SocketUtil.temporaryServerHostnameAndPort()
@@ -248,7 +255,7 @@ class GracefulTerminationSpec extends WordSpec with Matchers with BeforeAndAfter
         .bindAndHandle(routes, hostname, port, connectionContext = serverConnectionContext, settings = serverSettings)
         .futureValue
 
-    val basePoolSettings = ConnectionPoolSettings(system).withBaseConnectionBackoff(Duration.Zero)
+    def basePoolSettings = ConnectionPoolSettings(system).withBaseConnectionBackoff(Duration.Zero)
 
     def makeRequest(ensureNewConnection: Boolean = false): Future[HttpResponse] = {
       if (ensureNewConnection) {

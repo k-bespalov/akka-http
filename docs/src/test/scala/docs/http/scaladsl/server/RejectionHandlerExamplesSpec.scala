@@ -9,8 +9,6 @@ import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.server.RoutingSpec
 import docs.CompileOnlySpec
 
-// format: OFF
-
 object MyRejectionHandler {
 
   //#custom-handler-example
@@ -25,14 +23,17 @@ object MyRejectionHandler {
   object MyApp extends App {
     implicit def myRejectionHandler =
       RejectionHandler.newBuilder()
-        .handle { case MissingCookieRejection(cookieName) =>
-          complete(HttpResponse(BadRequest, entity = "No cookies, no service!!!"))
+        .handle {
+          case MissingCookieRejection(cookieName) =>
+            complete(HttpResponse(BadRequest, entity = "No cookies, no service!!!"))
         }
-        .handle { case AuthorizationFailedRejection =>
-          complete((Forbidden, "You're out of your depth!"))
+        .handle {
+          case AuthorizationFailedRejection =>
+            complete((Forbidden, "You're out of your depth!"))
         }
-        .handle { case ValidationRejection(msg, _) =>
-          complete((InternalServerError, "That wasn't valid! " + msg))
+        .handle {
+          case ValidationRejection(msg, _) =>
+            complete((InternalServerError, "That wasn't valid! " + msg))
         }
         .handleAll[MethodRejection] { methodRejections =>
           val names = methodRejections.map(_.supported.name)
@@ -71,7 +72,7 @@ object HandleNotFoundWithThePath {
   //#not-found-with-path
 }
 
-class RejectionHandlerExamplesSpec extends RoutingSpec with CompileOnlySpec{
+class RejectionHandlerExamplesSpec extends RoutingSpec with CompileOnlySpec {
 
   "example-1" in {
     //#example-1
@@ -79,14 +80,16 @@ class RejectionHandlerExamplesSpec extends RoutingSpec with CompileOnlySpec{
 
     val route =
       path("order") {
-        get {
-          complete("Received GET")
-        } ~
-        post {
-          decodeRequestWith(Gzip) {
-            complete("Received compressed POST")
+        concat(
+          get {
+            complete("Received GET")
+          },
+          post {
+            decodeRequestWith(Gzip) {
+              complete("Received compressed POST")
+            }
           }
-        }
+        )
       }
     //#example-1
   }
@@ -105,7 +108,7 @@ class RejectionHandlerExamplesSpec extends RoutingSpec with CompileOnlySpec{
 
             // we copy the response in order to keep all headers and status code, wrapping the message as hand rolled JSON
             // you could the entity using your favourite marshalling library (e.g. spray json or anything else)
-            res.copy(entity = HttpEntity(ContentTypes.`application/json`, s"""{"rejection": "$message"}"""))
+            res.withEntity(HttpEntity(ContentTypes.`application/json`, s"""{"rejection": "$message"}"""))
 
           case x => x // pass through all other types of responses
         }
@@ -139,7 +142,7 @@ class RejectionHandlerExamplesSpec extends RoutingSpec with CompileOnlySpec{
 
             // we copy the response in order to keep all headers and status code, wrapping the message as hand rolled JSON
             // you could the entity using your favourite marshalling library (e.g. spray json or anything else)
-            res.copy(entity = HttpEntity(ContentTypes.`application/json`, s"""{"rejection": "$message"}"""))
+            res.withEntity(HttpEntity(ContentTypes.`application/json`, s"""{"rejection": "$message"}"""))
 
           case x => x // pass through all other types of responses
         }

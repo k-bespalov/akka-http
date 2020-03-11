@@ -5,8 +5,6 @@
 package akka.http.scaladsl.testkit
 
 import scala.concurrent.duration._
-import org.scalatest.FreeSpec
-import org.scalatest.Matchers
 import akka.testkit._
 import akka.util.Timeout
 import akka.pattern.ask
@@ -16,11 +14,14 @@ import akka.http.scaladsl.model._
 import StatusCodes._
 import HttpMethods._
 import Directives._
+import org.scalatest.exceptions.TestFailedException
 
 import scala.concurrent.Await
 import scala.concurrent.Future
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-class ScalatestRouteTestSpec extends FreeSpec with Matchers with ScalatestRouteTest {
+class ScalatestRouteTestSpec extends AnyFreeSpec with Matchers with ScalatestRouteTest {
 
   "The ScalatestRouteTest should support" - {
 
@@ -84,6 +85,28 @@ class ScalatestRouteTestSpec extends FreeSpec with Matchers with ScalatestRouteT
         responseEntity shouldEqual HttpEntity(ContentTypes.`text/plain(UTF-8)`, "abc")
         header("Fancy") shouldEqual Some(pinkHeader)
       }(result)
+    }
+
+    "failing the test inside the route" in {
+
+      val route = get {
+        fail()
+      }
+
+      assertThrows[TestFailedException] {
+        Get() ~> route
+      }
+    }
+
+    "internal server error" in {
+
+      val route = get {
+        throw new RuntimeException("BOOM")
+      }
+
+      Get() ~> route ~> check {
+        status shouldEqual InternalServerError
+      }
     }
   }
 }

@@ -12,7 +12,7 @@ import com.typesafe.config.{ Config, ConfigFactory }
 
 import scala.concurrent.{ Await, Future }
 import scala.concurrent.duration._
-import org.scalatest.{ BeforeAndAfterAll, FreeSpec, Matchers }
+import org.scalatest.BeforeAndAfterAll
 import org.scalatest.matchers.Matcher
 import akka.util.ByteString
 import akka.actor.ActorSystem
@@ -31,8 +31,10 @@ import ParserOutput._
 import akka.http.scaladsl.model.MediaType.WithOpenCharset
 import akka.stream.stage.{ GraphStage, GraphStageLogic, InHandler, OutHandler }
 import akka.testkit._
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpec with Matchers with BeforeAndAfterAll {
+abstract class ResponseParserSpec(mode: String, newLine: String) extends AnyFreeSpec with Matchers with BeforeAndAfterAll {
   val testConf: Config = ConfigFactory.parseString("""
     akka.event-handlers = ["akka.testkit.TestEventListener"]
     akka.loglevel = WARNING
@@ -42,6 +44,7 @@ abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpe
 
   implicit val materializer = ActorMaterializer()
   val ServerOnTheMove = StatusCodes.custom(331, "Server on the move")
+  val TotallyUnrecognized = StatusCodes.custom(456, "Totally unrecognized")
 
   s"The response parsing logic should (mode: $mode)" - {
     "properly parse" - {
@@ -74,7 +77,7 @@ abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpe
         closeAfterResponseCompletion shouldEqual Seq(false)
       }
 
-      "a response with a custom status code" in new Test {
+      "a response with a registered custom status code" in new Test {
         override def parserSettings: ParserSettings =
           super.parserSettings.withCustomStatusCodes(ServerOnTheMove)
 
@@ -82,6 +85,17 @@ abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpe
           |Content-Length: 0
           |
           |""" should parseTo(HttpResponse(ServerOnTheMove))
+        closeAfterResponseCompletion shouldEqual Seq(false)
+      }
+
+      "a response with an unrecognized status code" in new Test {
+        // A client must understand the class of any status code, as indicated by the first digit, and
+        // treat an unrecognized status code as being equivalent to the x00 status code of that class
+        // https://tools.ietf.org/html/rfc7231#section-6
+        """HTTP/1.1 456 Totally unrecognized
+          |Content-Length: 0
+          |
+          |""" should parseTo(HttpResponse(TotallyUnrecognized))
         closeAfterResponseCompletion shouldEqual Seq(false)
       }
 
@@ -228,7 +242,7 @@ abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpe
           Right(HttpResponse(
             headers = List(`Transfer-Encoding`(TransferEncodings.Extension("fancy"))),
             entity = HttpEntity.Chunked(`application/pdf`, source()))),
-          Left(EntityStreamError(ErrorInfo("Entity stream truncation"))))
+          Left(EntityStreamError(ErrorInfo("Entity stream truncation. The HTTP parser was receiving an entity when the underlying connection was closed unexpectedly."))))
         closeAfterResponseCompletion shouldEqual Seq(false)
       }
 
@@ -280,7 +294,7 @@ abstract class ResponseParserSpec(mode: String, newLine: String) extends FreeSpe
       override def equals(other: scala.Any): Boolean = other match {
         case other: StrictEqualHttpResponse =>
 
-          this.resp.copy(entity = HttpEntity.Empty) == other.resp.copy(entity = HttpEntity.Empty) &&
+          this.resp.withEntity(HttpEntity.Empty) == other.resp.withEntity(HttpEntity.Empty) &&
             Await.result(this.resp.entity.toStrict(awaitAtMost), awaitAtMost) ==
             Await.result(other.resp.entity.toStrict(awaitAtMost), awaitAtMost)
       }

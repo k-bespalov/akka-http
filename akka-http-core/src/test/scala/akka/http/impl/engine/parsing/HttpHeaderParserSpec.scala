@@ -11,7 +11,7 @@ import com.typesafe.config.{ Config, ConfigFactory }
 
 import scala.annotation.tailrec
 import scala.util.Random
-import org.scalatest.{ BeforeAndAfterAll, Matchers, WordSpec }
+import org.scalatest.BeforeAndAfterAll
 import akka.util.ByteString
 import akka.actor.ActorSystem
 import akka.http.HashCodeCollider
@@ -21,8 +21,10 @@ import akka.http.impl.model.parser.CharacterClasses
 import akka.http.impl.util._
 import akka.http.scaladsl.settings.ParserSettings.IllegalResponseHeaderValueProcessingMode
 import akka.testkit.{ EventFilter, TestKit }
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.wordspec.AnyWordSpec
 
-abstract class HttpHeaderParserSpec(mode: String, newLine: String) extends WordSpec with Matchers with BeforeAndAfterAll {
+abstract class HttpHeaderParserSpec(mode: String, newLine: String) extends AnyWordSpec with Matchers with BeforeAndAfterAll {
 
   val testConf: Config = ConfigFactory.parseString("""
     akka.event-handlers = ["akka.testkit.TestEventListener"]
@@ -284,7 +286,6 @@ abstract class HttpHeaderParserSpec(mode: String, newLine: String) extends WordS
     ) {
       // This is actually quite rare since it needs upping the max header value length
       val numKeys = 10000
-      val value = "null"
 
       val regularKeys = Iterator.from(1).map(i => s"key_$i").take(numKeys)
       private val zeroHashStrings: Iterator[String] = HashCodeCollider.zeroHashCodeIterator()

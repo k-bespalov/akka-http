@@ -20,7 +20,6 @@ import akka.stream.scaladsl._
 import akka.stream.stage._
 import akka.stream._
 import akka.{ Done, NotUsed, stream }
-import akka.http.scaladsl.model.ContentType.{ Binary, NonBinary, WithMissingCharset }
 import akka.http.scaladsl.util.FastFuture
 import akka.http.javadsl.{ model => jm }
 import akka.http.impl.util.{ JavaMapping, StreamUtils }
@@ -126,6 +125,13 @@ sealed trait HttpEntity extends jm.HttpEntity {
    * Any other errors are reported through the new entity data stream.
    */
   def transformDataBytes(transformer: Flow[ByteString, ByteString, Any]): HttpEntity
+
+  /**
+   * Transforms this' entities data bytes with a transformer that will produce exactly the number of bytes given as
+   * `newContentLength`.
+   */
+  def transformDataBytes(newContentLength: Long, transformer: Flow[ByteString, ByteString, Any]): UniversalEntity =
+    HttpEntity.Default(contentType, newContentLength, dataBytes via transformer)
 
   /**
    * Creates a copy of this HttpEntity with the `contentType` overridden with the given one.
@@ -264,12 +270,6 @@ sealed trait UniversalEntity extends jm.UniversalEntity with MessageEntity with 
 
   def contentLength: Long
   def contentLengthOption: Option[Long] = Some(contentLength)
-
-  /**
-   * Transforms this' entities data bytes with a transformer that will produce exactly the number of bytes given as
-   * `newContentLength`.
-   */
-  def transformDataBytes(newContentLength: Long, transformer: Flow[ByteString, ByteString, Any]): UniversalEntity
 }
 
 object HttpEntity {
@@ -334,16 +334,13 @@ object HttpEntity {
     override def isKnownEmpty: Boolean = data.isEmpty
     override def isStrict: Boolean = true
 
-    override def dataBytes: Source[ByteString, NotUsed] = Source(data :: Nil)
+    override def dataBytes: Source[ByteString, NotUsed] = Source.single(data)
 
     override def toStrict(timeout: FiniteDuration)(implicit fm: Materializer) =
       FastFuture.successful(this)
 
     override def transformDataBytes(transformer: Flow[ByteString, ByteString, Any]): MessageEntity =
       HttpEntity.Chunked.fromData(contentType, Source.single(data).via(transformer))
-
-    override def transformDataBytes(newContentLength: Long, transformer: Flow[ByteString, ByteString, Any]): UniversalEntity =
-      HttpEntity.Default(contentType, newContentLength, Source.single(data) via transformer)
 
     override def withContentType(contentType: ContentType): HttpEntity.Strict =
       if (contentType == this.contentType) this else copy(contentType = contentType)
@@ -358,26 +355,9 @@ object HttpEntity {
     override def productPrefix = "HttpEntity.Strict"
 
     override def toString = {
-      val dataAsString = contentType match {
-        case _: Binary =>
-          data.toString()
-        case _: WithMissingCharset =>
-          data.toString()
-        case nb: NonBinary =>
-          try {
-            val maxBytes = 4096
-            if (data.length > maxBytes) {
-              val truncatedString = data.take(maxBytes).decodeString(nb.charset.value).dropRight(1)
-              s"$truncatedString ... (${data.length} bytes total)"
-            } else
-              data.decodeString(nb.charset.value)
-          } catch {
-            case NonFatal(e) =>
-              data.toString()
-          }
-      }
+      val dataSizeStr = s"${data.length} bytes total"
 
-      s"$productPrefix($contentType,$dataAsString)"
+      s"$productPrefix($contentType,$dataSizeStr)"
     }
 
     /** Java API */
@@ -400,9 +380,6 @@ object HttpEntity {
 
     override def transformDataBytes(transformer: Flow[ByteString, ByteString, Any]): HttpEntity.Chunked =
       HttpEntity.Chunked.fromData(contentType, data via transformer)
-
-    override def transformDataBytes(newContentLength: Long, transformer: Flow[ByteString, ByteString, Any]): UniversalEntity =
-      HttpEntity.Default(contentType, newContentLength, data via transformer)
 
     def withContentType(contentType: ContentType): HttpEntity.Default =
       if (contentType == this.contentType) this else copy(contentType = contentType)
@@ -512,15 +489,38 @@ object HttpEntity {
       withSizeLimit(SizeLimit.Disabled)
 
     override def transformDataBytes(transformer: Flow[ByteString, ByteString, Any]): HttpEntity.Chunked = {
-      val newData =
-        chunks.map {
-          case Chunk(data, "")    => data
-          case LastChunk("", Nil) => ByteString.empty
-          case _ =>
-            throw new IllegalArgumentException("Chunked.transformDataBytes not allowed for chunks with metadata")
-        } via transformer
+      // This construction allows to keep trailing headers. For that the stream is split into two
+      // tracks. One for the regular chunks and one for the LastChunk. Only the regular chunks are
+      // run through the user-supplied transformer, the LastChunk is just passed on. The tracks are
+      // then concatenated to produce the final stream.
+      val transformChunks = GraphDSL.create() { implicit builder: GraphDSL.Builder[NotUsed] =>
+        import akka.stream.scaladsl.GraphDSL.Implicits._
 
-      HttpEntity.Chunked.fromData(contentType, newData)
+        val partition = builder.add(Partition[HttpEntity.ChunkStreamPart](2, {
+          case c: Chunk     => 0
+          case c: LastChunk => 1
+        }))
+        val concat = builder.add(Concat[HttpEntity.ChunkStreamPart](2))
+
+        val chunkTransformer: Flow[HttpEntity.ChunkStreamPart, HttpEntity.ChunkStreamPart, Any] =
+          Flow[HttpEntity.ChunkStreamPart]
+            .map(_.data)
+            .via(transformer)
+            .map(b => Chunk(b))
+
+        val trailerBypass: Flow[HttpEntity.ChunkStreamPart, HttpEntity.ChunkStreamPart, Any] =
+          Flow[HttpEntity.ChunkStreamPart]
+            // make sure to filter out any errors here, otherwise they don't go through the user transformer
+            .recover { case NonFatal(ex) => Chunk(ByteString(0), "") }
+            // only needed to filter the out the result from recover in the line above
+            .collect { case lc @ LastChunk(_, s) if s.nonEmpty => lc }
+
+        partition ~> chunkTransformer ~> concat
+        partition ~> trailerBypass ~> concat
+        FlowShape(partition.in, concat.out)
+      }
+
+      HttpEntity.Chunked(contentType, chunks.via(transformChunks))
     }
 
     def withContentType(contentType: ContentType): HttpEntity.Chunked =

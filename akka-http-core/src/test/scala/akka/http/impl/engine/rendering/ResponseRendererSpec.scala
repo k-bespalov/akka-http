@@ -8,7 +8,7 @@ import com.typesafe.config.{ Config, ConfigFactory }
 
 import scala.concurrent.duration._
 import scala.concurrent.Await
-import org.scalatest.{ BeforeAndAfterAll, FreeSpec, Matchers }
+import org.scalatest.BeforeAndAfterAll
 import org.scalatest.matchers.Matcher
 import akka.actor.ActorSystem
 import akka.event.NoLogging
@@ -21,8 +21,10 @@ import akka.stream.ActorMaterializer
 import HttpEntity._
 import akka.http.impl.engine.rendering.ResponseRenderingContext.CloseRequested
 import akka.testkit._
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-class ResponseRendererSpec extends FreeSpec with Matchers with BeforeAndAfterAll {
+class ResponseRendererSpec extends AnyFreeSpec with Matchers with BeforeAndAfterAll {
   val testConf: Config = ConfigFactory.parseString("""
     akka.event-handlers = ["akka.testkit.TestEventListener"]
     akka.loglevel = WARNING""")
@@ -617,8 +619,8 @@ class ResponseRendererSpec extends FreeSpec with Matchers with BeforeAndAfterAll
             Source.single(ctx),
             renderer.named("renderer")
               .map {
-                case ResponseRenderingOutput.HttpData(bytes)      => bytes
-                case _: ResponseRenderingOutput.SwitchToWebSocket => throw new IllegalStateException("Didn't expect websocket response")
+                case ResponseRenderingOutput.HttpData(bytes)          => bytes
+                case _: ResponseRenderingOutput.SwitchToOtherProtocol => throw new IllegalStateException("Didn't expect protocol switch response")
               }
           )
 

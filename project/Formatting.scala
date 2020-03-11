@@ -6,7 +6,6 @@ package akka
 
 import sbt._
 import com.typesafe.sbt.SbtMultiJvm.MultiJvmKeys.MultiJvm
-import com.typesafe.sbt.SbtScalariform
 import com.typesafe.sbt.SbtScalariform.ScalariformKeys
 
 object Formatting {
@@ -27,7 +26,8 @@ object Formatting {
   )
 
   def setPreferences(preferences: IFormattingPreferences) = preferences
-    .setPreference(RewriteArrowSymbols, false)
+    .setPreference(RewriteArrowSymbols, true)
+    .setPreference(UseUnicodeArrows, false)
     .setPreference(AlignParameters, true)
     .setPreference(AlignSingleLineCaseStatements, true)
     .setPreference(DoubleIndentConstructorArguments, false)

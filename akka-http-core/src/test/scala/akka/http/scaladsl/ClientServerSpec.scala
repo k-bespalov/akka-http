@@ -14,6 +14,8 @@ import scala.concurrent.duration._
 import scala.concurrent.{ Await, Future, Promise }
 import scala.util.{ Success, Try }
 import akka.actor.ActorSystem
+import akka.event.Logging
+import akka.event.Logging.LogEvent
 import akka.http.impl.engine.ws.ByteStringSinkProbe
 import akka.http.impl.util._
 import akka.http.scaladsl.Http.ServerBinding
@@ -32,11 +34,13 @@ import akka.util.ByteString
 import com.typesafe.config.{ Config, ConfigFactory }
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import com.typesafe.sslconfig.ssl.{ SSLConfigSettings, SSLLooseConfig }
-import org.scalatest.{ BeforeAndAfterAll, Matchers, WordSpec }
+import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.concurrent.Eventually.eventually
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.wordspec.AnyWordSpec
 
-class ClientServerSpec extends WordSpec with Matchers with BeforeAndAfterAll with ScalaFutures with WithLogCapturing {
+class ClientServerSpec extends AnyWordSpec with Matchers with BeforeAndAfterAll with ScalaFutures with WithLogCapturing {
   val testConf: Config = ConfigFactory.parseString("""
     akka.loglevel = DEBUG
     akka.loggers = ["akka.http.impl.util.SilenceAllTestEventListener"]
@@ -60,22 +64,23 @@ class ClientServerSpec extends WordSpec with Matchers with BeforeAndAfterAll wit
   "The low-level HTTP infrastructure" should {
 
     "properly bind a server" in {
-      val (hostname, port) = SocketUtil.temporaryServerHostnameAndPort()
       val probe = TestSubscriber.manualProbe[Http.IncomingConnection]()
-      val binding = Http().bind(hostname, port).toMat(Sink.fromSubscriber(probe))(Keep.left).run()
+      val binding = Http().bind("127.0.0.1", 0).to(Sink.fromSubscriber(probe)).run()
       val sub = probe.expectSubscription() // if we get it we are bound
-      Await.result(binding, 1.second.dilated)
+      Await.result(binding, 1.second.dilated).unbind()
       sub.cancel()
     }
 
     "properly bind a server with a default port set via settings" in {
-      val (hostname, port) = SocketUtil.temporaryServerHostnameAndPort()
       val probe = TestSubscriber.manualProbe[Http.IncomingConnection]()
-      val settings = ServerSettings(system).withDefaultHttpPort(port)
-      val binding = Http().bind(hostname, settings = settings).toMat(Sink.fromSubscriber(probe))(Keep.left).run()
+      // not really testing anything here, problem is that it is hard to find an unused port otherwise
+      val settings = ServerSettings(system).withDefaultHttpPort(0)
+      val bindingF = Http().bind("0.0.0.0", settings = settings).to(Sink.fromSubscriber(probe)).run()
       val sub = probe.expectSubscription() // if we get it we are bound
-      val address = Await.result(binding, 1.second.dilated).localAddress
-      address.getPort shouldEqual port
+      val binding = Await.result(bindingF, 1.second.dilated)
+      // though, that wouldn't probably happen because binding ports < 1024 is restricted in most environments
+      binding.localAddress.getPort should not be (80)
+      binding.unbind()
       sub.cancel()
     }
 
@@ -475,6 +480,36 @@ class ClientServerSpec extends WordSpec with Matchers with BeforeAndAfterAll wit
       }
     }
 
+    "properly complete a simple request/response cycle using Http.singleRequest" in Utils.assertAllStagesStopped {
+      new TestSetup {
+        // make sure no log message above DEBUG are printed by that exchange
+        EventFilter.custom({ case l: LogEvent if l.level != Logging.DebugLevel => true }, 0).intercept {
+          val settings = ConnectionPoolSettings(system).withIdleTimeout(500.millis)
+
+          val request = HttpRequest(uri = s"http://$hostname:$port/abc")
+
+          val responseFut = Http().singleRequest(request, settings = settings)
+          val (serverIn, serverOut) = acceptConnection()
+
+          val serverInSub = serverIn.expectSubscription()
+          serverInSub.request(1)
+          serverIn.expectNext().uri shouldEqual Uri(s"http://$hostname:$port/abc")
+
+          val serverOutSub = serverOut.expectSubscription()
+          serverOutSub.expectRequest()
+          serverOutSub.sendNext(HttpResponse(entity = "yeah"))
+
+          val response = responseFut.awaitResult(1.second.dilated)
+          toStrict(response.entity) shouldEqual HttpEntity("yeah")
+
+          serverIn.expectComplete()
+          serverOutSub.expectCancellation()
+
+          binding.foreach(_.unbind())
+        }
+      }
+    }
+
     "properly complete a chunked request/response cycle" in Utils.assertAllStagesStopped {
       new TestSetup {
         val (clientOut, clientIn) = openNewClientConnection()
@@ -578,6 +613,7 @@ Host: example.com
         Try(Await.result(result, 2.seconds).utf8String) match {
           case scala.util.Success(body)                => fail(body)
           case scala.util.Failure(_: TimeoutException) => // Expected
+          case scala.util.Failure(other)               => fail(other)
         }
       } finally {
         responsePromise.failure(new TimeoutException())
@@ -739,7 +775,7 @@ Host: example.com
     }
 
     "produce a useful error message when connecting to a HTTP endpoint over HTTPS" in Utils.assertAllStagesStopped {
-      val dummyFlow = Flow.fromFunction((_: HttpRequest) => ???)
+      val dummyFlow = Flow[HttpRequest].map(_ => ???)
 
       val binding = Http().bindAndHandle(dummyFlow, "127.0.0.1", port = 0).futureValue
       val uri = "https://" + binding.localAddress.getHostString + ":" + binding.localAddress.getPort
@@ -767,7 +803,7 @@ Host: example.com
       val settings = configOverrides.toOption.fold(ServerSettings(system))(ServerSettings(_))
       val connections = Http().bind(hostname, port, settings = settings)
       val probe = TestSubscriber.manualProbe[Http.IncomingConnection]
-      val binding = connections.toMat(Sink.fromSubscriber(probe))(Keep.left).run()
+      val binding = connections.to(Sink.fromSubscriber(probe)).run()
       (probe, binding)
     }
     val connSourceSub = connSource.expectSubscription()

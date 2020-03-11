@@ -25,6 +25,7 @@ import akka.util.OptionVal
 
 import scala.concurrent.Future
 import scala.concurrent.duration._
+import scala.util.control.NoStackTrace
 import scala.util.control.NonFatal
 import scala.util.{ Failure, Random, Success, Try }
 
@@ -132,7 +133,7 @@ private[client] object NewHostConnectionPool {
             // don't increase if the embargo level has already changed since the start of the connection attempt
           }
           if (_connectionEmbargo != oldValue) {
-            log.warning(s"Connection attempt failed. Backing off new connection attempts for at least ${_connectionEmbargo}.")
+            log.debug(s"Connection attempt failed. Backing off new connection attempts for at least ${_connectionEmbargo}.")
             slots.foreach(_.onNewConnectionEmbargo(_connectionEmbargo))
           }
         }
@@ -193,8 +194,13 @@ private[client] object NewHostConnectionPool {
           def isIdle: Boolean = state.isIdle
           def isConnected: Boolean = state.isConnected
           def shutdown(): Unit = {
-            // TODO: should we offer errors to the connection?
-            closeConnection()
+            // if the connection is idle, we just complete it regularly, otherwise, we forcibly tear it down
+            // with an error (which will be logged in OutgoingConnectionBlueprint, see `mapError` there).
+            val reason =
+              if (isIdle) None
+              else Some(new IllegalStateException("Pool slot was shut down") with NoStackTrace)
+
+            closeConnection(reason)
 
             state.onShutdown(this)
           }
@@ -267,9 +273,10 @@ private[client] object NewHostConnectionPool {
                   case _ => // no timeout set, nothing to do
                 }
 
-                if (!state.isConnected && connection != null) {
-                  debug(s"State change from [${previousState.name}] to [Unconnected]. Closing the existing connection.")
-                  closeConnection()
+                if (connection != null && state.isInstanceOf[ShouldCloseConnectionState]) {
+                  debug(s"State change from [${previousState.name}] to [$state]. Closing the existing connection.")
+                  closeConnection(state.asInstanceOf[ShouldCloseConnectionState].failure)
+                  state = Unconnected
                 }
 
                 if (!previousState.isIdle && state.isIdle && !(state == Unconnected && currentEmbargo != Duration.Zero)) {
@@ -315,7 +322,7 @@ private[client] object NewHostConnectionPool {
 
                   try {
                     cancelCurrentTimeout()
-                    closeConnection()
+                    closeConnection(Some(ex))
                     state.onShutdown(this)
                     logic.slotsWaitingForDispatch.remove(this)
                     OptionVal.None
@@ -387,9 +394,9 @@ private[client] object NewHostConnectionPool {
             }
           }
 
-          def closeConnection(): Unit =
+          def closeConnection(failure: Option[Throwable]): Unit =
             if (connection ne null) {
-              connection.close()
+              connection.close(failure)
               connection = null
             }
           def isCurrentConnection(conn: SlotConnection): Boolean = connection eq conn
@@ -418,6 +425,7 @@ private[client] object NewHostConnectionPool {
           responseIn: SubSinkInlet[HttpResponse]
         ) extends InHandler with OutHandler { connection =>
           var ongoingResponseEntity: Option[HttpEntity] = None
+          var ongoingResponseEntityKillSwitch: Option[KillSwitch] = None
           var connectionEstablished: Boolean = false
 
           /** Will only be executed if this connection is still the current connection for its slot */
@@ -439,12 +447,24 @@ private[client] object NewHostConnectionPool {
 
             emitRequest(newRequest)
           }
-          def close(): Unit = {
-            requestOut.complete()
+
+          /**
+           * If regular is true connection is closed, otherwise, it is aborted.
+           *
+           * A connection should be closed regularly after a request/response with `Connection: close` has been completed.
+           * A connection should be aborted after failures.
+           */
+          def close(failure: Option[Throwable]): Unit = {
+            failure match {
+              case None          => requestOut.complete()
+              case Some(failure) => requestOut.fail(failure)
+            }
+
             responseIn.cancel()
 
-            // FIXME: or should we use discardEntity which does Sink.ignore?
+            val exception = failure.getOrElse(new IllegalStateException("Connection was closed while response was still in-flight"))
             ongoingResponseEntity.foreach(_.dataBytes.runWith(Sink.cancelled)(subFusingMaterializer))
+            ongoingResponseEntityKillSwitch.foreach(_.abort(exception))
           }
           def isClosed: Boolean = requestOut.isClosed || responseIn.isClosed
 
@@ -456,19 +476,26 @@ private[client] object NewHostConnectionPool {
             response.entity match {
               case _: HttpEntity.Strict => withSlot(_.onResponseReceived(response))
               case e =>
-                ongoingResponseEntity = Some(e)
-
-                val (newEntity, (entitySubscribed, entityComplete)) =
+                val (newEntity, StreamUtils.StreamControl(entitySubscribed, entityComplete, entityKillSwitch)) =
                   StreamUtils.transformEntityStream(response.entity, StreamUtils.CaptureMaterializationAndTerminationOp)
 
+                ongoingResponseEntity = Some(e)
+                ongoingResponseEntityKillSwitch = entityKillSwitch
+
                 entitySubscribed.onComplete(safely {
-                  case Success(()) =>
+                  case Success(_) =>
                     withSlot(_.onResponseEntitySubscribed())
 
-                    entityComplete.onComplete(safely {
-                      case Success(_)     => withSlot(_.onResponseEntityCompleted())
-                      case Failure(cause) => withSlot(_.onResponseEntityFailed(cause))
-                    })(ExecutionContexts.sameThreadExecutionContext)
+                    entityComplete.onComplete {
+                      safely { res =>
+                        res match {
+                          case Success(_)     => withSlot(_.onResponseEntityCompleted())
+                          case Failure(cause) => withSlot(_.onResponseEntityFailed(cause))
+                        }
+                        ongoingResponseEntity = None
+                        ongoingResponseEntityKillSwitch = None
+                      }
+                    }(ExecutionContexts.sameThreadExecutionContext)
                   case Failure(_) => throw new IllegalStateException("Should never fail")
                 })(ExecutionContexts.sameThreadExecutionContext)
 
@@ -484,11 +511,14 @@ private[client] object NewHostConnectionPool {
               slot.onConnectionCompleted()
             }
           override def onUpstreamFailure(ex: Throwable): Unit =
-            if (connectionEstablished)
-              withSlot { slot =>
+            withSlot { slot =>
+              if (connectionEstablished) {
                 slot.debug("Connection failed")
                 slot.onConnectionFailed(ex)
               }
+              // otherwise, rely on connection.onComplete to fail below
+              // (connection error is sent through matValue future and through the stream)
+            }
 
           def onPull(): Unit = () // emitRequests makes sure not to push too early
 
@@ -521,7 +551,7 @@ private[client] object NewHostConnectionPool {
           val connection =
             Source.fromGraph(requestOut.source)
               .viaMat(connectionFlow)(Keep.right)
-              .toMat(responseIn.sink)(Keep.left)
+              .to(responseIn.sink)
               .run()(subFusingMaterializer)
 
           val slotCon = new SlotConnection(slot, requestOut, responseIn)
@@ -549,7 +579,7 @@ private[client] object NewHostConnectionPool {
 
         override def onUpstreamFinish(): Unit = {
           log.debug("Pool upstream was completed")
-          super.onDownstreamFinish()
+          super.onUpstreamFinish()
         }
         override def onUpstreamFailure(ex: Throwable): Unit = {
           log.debug("Pool upstream failed with {}", ex)
@@ -560,8 +590,8 @@ private[client] object NewHostConnectionPool {
           super.onDownstreamFinish()
         }
         override def postStop(): Unit = {
-          log.debug("Pool stopped")
           slots.foreach(_.shutdown())
+          log.debug(s"Pool stopped")
         }
 
         private def willClose(response: HttpResponse): Boolean =

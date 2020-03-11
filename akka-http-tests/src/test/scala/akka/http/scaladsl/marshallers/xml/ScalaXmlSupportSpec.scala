@@ -8,18 +8,22 @@ import java.io.File
 import java.nio.file.Files
 
 import org.xml.sax.SAXParseException
+
 import scala.xml.NodeSeq
-import scala.concurrent.{ Future, Await }
+import scala.concurrent.{ Await, Future }
 import scala.concurrent.duration._
-import org.scalatest.{ Inside, FreeSpec, Matchers }
+import org.scalatest.Inside
 import akka.util.ByteString
 import akka.http.scaladsl.testkit.ScalatestRouteTest
-import akka.http.scaladsl.unmarshalling.{ Unmarshaller, Unmarshal }
+import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.http.scaladsl.model._
 import akka.testkit._
 import MediaTypes._
+import akka.http.scaladsl.unmarshalling.Unmarshaller.UnsupportedContentTypeException
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-class ScalaXmlSupportSpec extends FreeSpec with Matchers with ScalatestRouteTest with Inside {
+class ScalaXmlSupportSpec extends AnyFreeSpec with Matchers with ScalatestRouteTest with Inside {
   import ScalaXmlSupport._
 
   "NodeSeqMarshaller should" - {
@@ -32,7 +36,7 @@ class ScalaXmlSupportSpec extends FreeSpec with Matchers with ScalatestRouteTest
     }
     "reject `application/octet-stream`" in {
       Unmarshal(HttpEntity(`application/octet-stream`, ByteString("<int>Hällö</int>"))).to[NodeSeq].map(_.text) should
-        haveFailedWith(Unmarshaller.UnsupportedContentTypeException(nodeSeqContentTypeRanges: _*))
+        haveFailedWith(UnsupportedContentTypeException(Some(ContentTypes.`application/octet-stream`), nodeSeqContentTypeRanges: _*))
     }
 
     "don't be vulnerable to XXE attacks" - {

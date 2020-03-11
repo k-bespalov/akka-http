@@ -14,6 +14,7 @@ import akka.http.scaladsl.unmarshalling._
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.util.FastFuture
 import FastFuture._
+import akka.http.scaladsl.unmarshalling.Unmarshaller.UnsupportedContentTypeException
 
 /**
  * Read-only abstraction on top of `application/x-www-form-urlencoded` and multipart form data,
@@ -65,9 +66,9 @@ object StrictForm {
           fsu(value.entity.data.decodeString(charsetName))
       })
 
-    @implicitNotFound(msg =
-      s"In order to unmarshal a `StrictForm.Field` to type `$${T}` you need to supply a " +
-        s"`FromStringUnmarshaller[$${T}]` and/or a `FromEntityUnmarshaller[$${T}]`")
+    @implicitNotFound(
+      "In order to unmarshal a `StrictForm.Field` to type `${T}` you need to supply a " +
+        "`FromStringUnmarshaller[${T}]` and/or a `FromEntityUnmarshaller[${T}]`")
     sealed trait FieldUnmarshaller[T] {
       def unmarshalString(value: String)(implicit ec: ExecutionContext, mat: Materializer): Future[T]
       def unmarshalPart(value: Multipart.FormData.BodyPart.Strict)(implicit ec: ExecutionContext, mat: Materializer): Future[T]
@@ -129,10 +130,10 @@ object StrictForm {
           }
 
         tryUnmarshalToQueryForm.fast.recoverWith {
-          case Unmarshaller.UnsupportedContentTypeException(supported1) =>
+          case UnsupportedContentTypeException(supported) =>
             tryUnmarshalToMultipartForm.fast.recoverWith {
-              case Unmarshaller.UnsupportedContentTypeException(supported2) =>
-                FastFuture.failed(Unmarshaller.UnsupportedContentTypeException(supported1 ++ supported2))
+              case e: UnsupportedContentTypeException =>
+                FastFuture.failed(UnsupportedContentTypeException(supported ++ e.supported, e.actualContentType))
             }
         }
     }
@@ -145,7 +146,7 @@ object StrictForm {
   object FileData {
     implicit val unmarshaller: FromStrictFormFieldUnmarshaller[FileData] =
       Unmarshaller strict {
-        case Field.FromString(_)  => throw Unmarshaller.UnsupportedContentTypeException(MediaTypes.`application/x-www-form-urlencoded`)
+        case Field.FromString(_)  => throw UnsupportedContentTypeException(None, MediaTypes.`application/x-www-form-urlencoded`)
         case Field.FromPart(part) => FileData(part.filename, part.entity)
       }
   }

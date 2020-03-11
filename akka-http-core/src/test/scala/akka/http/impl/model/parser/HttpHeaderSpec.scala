@@ -6,7 +6,6 @@ package akka.http.impl.model.parser
 
 import akka.http.scaladsl.settings.ParserSettings.CookieParsingMode
 import akka.http.impl.model.parser.HeaderParser.Settings
-import org.scalatest.{ FreeSpec, Matchers }
 import org.scalatest.matchers.{ MatchResult, Matcher }
 import akka.http.impl.util._
 import akka.http.scaladsl.model._
@@ -21,8 +20,10 @@ import java.net.InetAddress
 
 import akka.http.scaladsl.model.MediaType.WithOpenCharset
 import org.scalatest.exceptions.TestFailedException
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-class HttpHeaderSpec extends FreeSpec with Matchers {
+class HttpHeaderSpec extends AnyFreeSpec with Matchers {
   val `application/vnd.spray` = MediaType.applicationBinary("vnd.spray", MediaType.Compressible)
   val PROPFIND = HttpMethod.custom("PROPFIND")
 
@@ -208,12 +209,22 @@ class HttpHeaderSpec extends FreeSpec with Matchers {
         .renderedTo("999999999999999999")
     }
 
+    "Content-Location" in {
+      "Content-Location: https://spray.io/secure" =!= `Content-Location`(Uri("https://spray.io/secure"))
+      "Content-Location: /en-us/default.aspx?foo=bar" =!= `Content-Location`(Uri("/en-us/default.aspx?foo=bar"))
+      "Content-Location: https://akka.io/#sec" =!= ErrorInfo(
+        "Illegal HTTP header 'Content-Location': requirement failed",
+        "Content-Location header URI must not contain a fragment")
+    }
+
     "Content-Type" in {
       "Content-Type: application/pdf" =!=
         `Content-Type`(`application/pdf`)
       "Content-Type: application/json" =!=
         `Content-Type`(`application/json`)
       "Content-Type: text/plain; charset=utf8" =!=
+        `Content-Type`(ContentType(`text/plain`, `UTF-8`)).renderedTo("text/plain; charset=UTF-8")
+      "Content-Type: text/plain; Charset=utf8" =!=
         `Content-Type`(ContentType(`text/plain`, `UTF-8`)).renderedTo("text/plain; charset=UTF-8")
       "Content-Type: text/plain" =!=
         `Content-Type`(ContentType.WithMissingCharset(MediaTypes.`text/plain`)).renderedTo("text/plain")

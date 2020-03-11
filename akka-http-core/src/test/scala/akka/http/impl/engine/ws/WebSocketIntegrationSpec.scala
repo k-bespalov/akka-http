@@ -109,7 +109,7 @@ class WebSocketIntegrationSpec extends AkkaSpec("akka.stream.materializer.debug.
       response.futureValue.response.status.isSuccess should ===(true)
       sink
         .request(10)
-        .expectNoMsg(1500.millis)
+        .expectNoMessage(1500.millis)
 
       breaker.trySuccess(Done)
 
@@ -202,7 +202,7 @@ class WebSocketIntegrationSpec extends AkkaSpec("akka.stream.materializer.debug.
         WebSocketRequest("ws://127.0.0.1:65535/no/server/here"),
         settings = ClientConnectionSettings(system).withConnectingTimeout(250.millis.dilated))
 
-      val future = Source.maybe[Message].viaMat(flow)(Keep.right).toMat(Sink.ignore)(Keep.left).run()
+      val future = Source.maybe[Message].viaMat(flow)(Keep.right).to(Sink.ignore).run()
       import system.dispatcher
       whenReady(future.map(r => Success(r)).recover { case ex => Failure(ex) }) { resTry =>
         resTry.isFailure should ===(true)

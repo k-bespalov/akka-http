@@ -1,7 +1,8 @@
 # The PathMatcher DSL
 
-For being able to work with the @ref[PathDirectives](directives/path-directives/index.md) effectively you should have some understanding of the
-`PathMatcher` mini-DSL that Akka HTTP provides for elegantly defining URI matching behavior.
+The `PathMatcher` mini-DSL is used to match incoming URL's and extract values from them. It is used in the @ref[`path` directive](directives/path-directives/path.md).
+
+Some simple examples of the DSL in action can be found [below](#examples).
 
 ## Overview
 
@@ -158,7 +159,7 @@ PathMatchers.segment(String)
 Note that strings are interpreted as the decoded representation of the path, so if they include a '/' character
 this character will match "%2F" in the encoded raw URI!
 
-PathMatchers.regex
+PathMatchers.segment(java.util.regex.Pattern)
 : You can use a regular expression instance as a path matcher, which matches whatever the regex matches and extracts
 one `String` value. A `PathMatcher` created from a regular expression extracts either the complete match (if the
 regex doesn't contain a capture group) or the capture group (if the regex contains exactly one capture group).

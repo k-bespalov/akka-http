@@ -21,12 +21,14 @@ import akka.http.impl.engine.server._
 import akka.http.impl.engine.ws.WebSocketClientBlueprint
 import akka.http.impl.settings.{ ConnectionPoolSetup, HostConnectionPoolSetup }
 import akka.http.impl.util.StreamUtils
-import akka.http.scaladsl.UseHttp2.{ Always, Never }
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.Host
 import akka.http.scaladsl.model.ws.{ Message, WebSocketRequest, WebSocketUpgradeResponse }
 import akka.http.scaladsl.settings.{ ClientConnectionSettings, ConnectionPoolSettings, ServerSettings }
 import akka.http.scaladsl.util.FastFuture
+import akka.stream.Attributes.CancellationStrategy
+import akka.stream.Attributes.CancellationStrategy.AfterDelay
+import akka.stream.Attributes.CancellationStrategy.FailStage
 import akka.{ Done, NotUsed }
 import akka.stream._
 import akka.stream.TLSProtocol._
@@ -119,7 +121,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     Flow.fromGraph(
       Flow[HttpRequest]
         .watchTermination()(Keep.right)
-        .viaMat(handler)(Keep.left)
+        .via(handler)
         .watchTermination() { (termWatchBefore, termWatchAfter) =>
           // flag termination when the user handler has gotten (or has emitted) termination
           // signals in both directions
@@ -203,7 +205,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   private[http] def bind(interface: String, port: Int,
                          connectionContext: ConnectionContext,
                          settings:          ServerSettings,
-                         log:               LoggingAdapter)(implicit fm: Materializer): Source[Http.IncomingConnection, Future[ServerBinding]] =
+                         log:               LoggingAdapter, fm: Materializer): Source[Http.IncomingConnection, Future[ServerBinding]] =
     bindImpl(interface, port, connectionContext, settings, log)
 
   /**
@@ -240,7 +242,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
                 (done, connectionTerminator)
             }
             .addAttributes(prepareAttributes(settings, incoming))
-            .joinMat(incoming.flow)(Keep.left)
+            .join(incoming.flow)
             .mapMaterializedValue {
               case (future, connectionTerminator) =>
                 masterTerminator.registerConnection(connectionTerminator)(fm.executionContext)
@@ -318,11 +320,8 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     settings:          ServerSettings    = ServerSettings(system),
     parallelism:       Int               = 0,
     log:               LoggingAdapter    = system.log)(implicit fm: Materializer): Future[ServerBinding] = {
-    val http2Enabled = settings.previewServerSettings.enableHttp2 && connectionContext.http2 != Never
-    val http2Forced = connectionContext.http2 == Always
-    if (http2Enabled && (connectionContext.isSecure || http2Forced)) {
-      // We do not support HTTP/2 negotiation for insecure connections (h2c), https://github.com/akka/akka-http/issues/1966
-      log.debug("Binding server using HTTP/2{}", if (http2Forced) " (forced to be used without TLS)" else "")
+    if (settings.previewServerSettings.enableHttp2) {
+      log.debug("Binding server using HTTP/2")
 
       val definitiveSettings =
         if (parallelism > 0) settings.mapHttp2Settings(_.withMaxConcurrentStreams(parallelism))
@@ -330,10 +329,6 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
         else settings
       Http2Shadow.bindAndHandleAsync(handler, interface, port, connectionContext, definitiveSettings, definitiveSettings.http2Settings.maxConcurrentStreams, log)(fm)
     } else {
-      if (http2Enabled)
-        log.debug("The akka.http.server.preview.enable-http2 flag was set, " +
-          "but a plain HttpConnectionContext (not Https) was given, binding using plain HTTP...")
-
       val definitiveParallelism =
         if (parallelism > 0) parallelism
         else if (parallelism < 0) throw new IllegalArgumentException("Only positive values allowed for `parallelism`.")
@@ -372,7 +367,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   }
 
   @deprecated("Binary compatibility method. Use the new `serverLayer` method without the implicit materializer instead.", "10.0.11")
-  private[http] def serverLayer()(implicit mat: Materializer): ServerLayer =
+  private[http] def serverLayer(mat: Materializer): ServerLayer =
     serverLayerImpl()
 
   @deprecated("Binary compatibility method. Use the new `serverLayer` method without the implicit materializer instead.", "10.0.11")
@@ -380,7 +375,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     settings:           ServerSettings,
     remoteAddress:      Option[InetSocketAddress],
     log:                LoggingAdapter,
-    isSecureConnection: Boolean)(implicit mat: Materializer): ServerLayer =
+    isSecureConnection: Boolean, mat: Materializer): ServerLayer =
     serverLayerImpl(settings, remoteAddress, log, isSecureConnection)
 
   // for binary-compatibility, since 10.0.0
@@ -388,7 +383,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   private[http] def serverLayer(
     settings:      ServerSettings,
     remoteAddress: Option[InetSocketAddress],
-    log:           LoggingAdapter)(implicit mat: Materializer): ServerLayer =
+    log:           LoggingAdapter, mat: Materializer): ServerLayer =
     serverLayerImpl(settings, remoteAddress, log)
 
   // ** CLIENT ** //
@@ -470,6 +465,8 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     val hostHeader = if (port == connectionContext.defaultPort) Host(host) else Host(host, port)
     val layer = clientLayer(hostHeader, settings, log)
     layer.joinMat(_outgoingTlsConnectionLayer(host, port, settings, connectionContext, log))(Keep.right)
+      // already added in clientLayer but needed here again to also include transport layer
+      .addAttributes(cancellationStrategyAttributeForDelay(settings.streamCancellationDelay))
   }
 
   private def _outgoingTlsConnectionLayer(host: String, port: Int,
@@ -497,6 +494,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     settings:   ClientConnectionSettings,
     log:        LoggingAdapter           = system.log): ClientLayer =
     OutgoingConnectionBlueprint(hostHeader, settings, log)
+      .addAttributes(cancellationStrategyAttributeForDelay(settings.streamCancellationDelay))
 
   // ** CONNECTION POOL ** //
 
@@ -601,7 +599,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   @deprecated("Deprecated in favor of method without implicit materializer", "10.0.11")
   private[http] def cachedHostConnectionPool[T](host: String, port: Int,
                                                 settings: ConnectionPoolSettings,
-                                                log:      LoggingAdapter)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] =
+                                                log:      LoggingAdapter, fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] =
     cachedHostConnectionPoolImpl(host, port, settings, log)
 
   /**
@@ -631,7 +629,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   private[http] def cachedHostConnectionPoolHttps[T](host: String, port: Int,
                                                      connectionContext: HttpsConnectionContext,
                                                      settings:          ConnectionPoolSettings,
-                                                     log:               LoggingAdapter)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] =
+                                                     log:               LoggingAdapter, fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] =
     cachedHostConnectionPoolHttpsImpl(host, port, connectionContext, settings, log)
 
   /**
@@ -688,7 +686,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
   private[http] def superPool[T](
     connectionContext: HttpsConnectionContext,
     settings:          ConnectionPoolSettings,
-    log:               LoggingAdapter)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), NotUsed] =
+    log:               LoggingAdapter, fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), NotUsed] =
     superPoolImpl(connectionContext, settings, log)
 
   /**
@@ -728,7 +726,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     request:           HttpRequest,
     connectionContext: HttpsConnectionContext,
     settings:          ConnectionPoolSettings,
-    log:               LoggingAdapter)(implicit fm: Materializer): Future[HttpResponse] =
+    log:               LoggingAdapter, fm: Materializer): Future[HttpResponse] =
     singleRequestImpl(request, connectionContext, settings, log)
 
   /**
@@ -742,6 +740,7 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     settings: ClientConnectionSettings = ClientConnectionSettings(system),
     log:      LoggingAdapter           = system.log): Http.WebSocketClientLayer =
     WebSocketClientBlueprint(request, settings, log)
+      .addAttributes(cancellationStrategyAttributeForDelay(settings.streamCancellationDelay))
 
   /**
    * Constructs a flow that once materialized establishes a WebSocket connection to the given Uri.
@@ -769,7 +768,9 @@ class HttpExt private[http] (private val config: Config)(implicit val system: Ex
     val port = uri.effectivePort
 
     webSocketClientLayer(request, settings, log)
-      .joinMat(_outgoingTlsConnectionLayer(host, port, settings.withLocalAddressOverride(localAddress), ctx, log))(Keep.left)
+      .join(_outgoingTlsConnectionLayer(host, port, settings.withLocalAddressOverride(localAddress), ctx, log))
+      // also added webSocketClientLayer but we want to make sure it covers the whole stack
+      .addAttributes(cancellationStrategyAttributeForDelay(settings.streamCancellationDelay))
   }
 
   /**
@@ -1135,6 +1136,14 @@ object Http extends ExtensionId[HttpExt] with ExtensionIdProvider {
     if (settings.remoteAddressHeader) HttpAttributes.remoteAddress(incoming.remoteAddress)
     else HttpAttributes.empty
 
+  @InternalApi
+  private[http] def cancellationStrategyAttributeForDelay(delay: FiniteDuration): Attributes =
+    Attributes(CancellationStrategy {
+      delay match {
+        case Duration.Zero => FailStage
+        case d             => AfterDelay(d, FailStage)
+      }
+    })
 }
 
 /**
@@ -1229,8 +1238,7 @@ trait DefaultSSLContextCreation {
       Some(cipherSuites.toList),
       Some(defaultProtocols.toList),
       clientAuth,
-      Some(defaultParams),
-      UseHttp2.Negotiated)
+      Some(defaultParams))
   }
 
 }

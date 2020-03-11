@@ -5,10 +5,12 @@
 package akka.http.scaladsl.server
 package directives
 
-import org.scalatest.{ FreeSpec, Inside }
+import org.scalatest.Inside
 import akka.http.scaladsl.unmarshalling.Unmarshaller, Unmarshaller._
+import akka.http.scaladsl.model.StatusCodes
+import org.scalatest.freespec.AnyFreeSpec
 
-class ParameterDirectivesSpec extends FreeSpec with GenericRoutingSpec with Inside {
+class ParameterDirectivesSpec extends AnyFreeSpec with GenericRoutingSpec with Inside {
   "when used with 'as[Int]' the parameter directive should" - {
     "extract a parameter value as Int" in {
       Get("/?amount=123") ~> {
@@ -272,6 +274,45 @@ class ParameterDirectivesSpec extends FreeSpec with GenericRoutingSpec with Insi
     "extract parameters with duplicate keys" in {
       Get("/?a=b&e=f&c=d&a=z") ~> completeAsList ~> check {
         responseAs[String] shouldEqual "4: [a -> b, a -> z, c -> d, e -> f]"
+      }
+    }
+  }
+
+  "when used with 'as[A](constructor)' the parameter directive should" - {
+    "extract a parameter value as Case Class" in {
+      case class Color(red: Int, green: Int, blue: Int)
+      Get("/?red=90&green=50&blue=0") ~> {
+        parameter('red.as[Int], 'green.as[Int], 'blue.as[Int]).as(Color) { color =>
+          complete(s"${color.red} ${color.green} ${color.blue}")
+        }
+      } ~> check { responseAs[String] shouldEqual "90 50 0" }
+    }
+    "reject the request with a ValidationRejection if a parameter value violate requirements" in {
+      case class Color(red: Int, green: Int, blue: Int) {
+        require(0 <= red && red <= 255)
+        require(0 <= green && green <= 255)
+        require(0 <= blue && blue <= 255)
+      }
+      Get("/?red=500&green=0&blue=0") ~> {
+        parameter('red.as[Int], 'green.as[Int], 'blue.as[Int]).as(Color) { color =>
+          complete(s"${color.red} ${color.green} ${color.blue}")
+        }
+      } ~> check {
+        rejection should matchPattern { case ValidationRejection("requirement failed", _) => }
+      }
+    }
+    "fail the request with InternalServerError if an IllegalArgumentException happens for another reason" in {
+      case class Color(red: Int, green: Int, blue: Int) {
+        require(0 <= red && red <= 255)
+        require(0 <= green && green <= 255)
+        require(0 <= blue && blue <= 255)
+      }
+      Get("/?red=0&green=0&blue=0") ~> {
+        parameter('red.as[Int], 'green.as[Int], 'blue.as[Int]).as(Color) { _ =>
+          throw new IllegalArgumentException
+        }
+      } ~> check {
+        status shouldEqual StatusCodes.InternalServerError
       }
     }
   }

@@ -4,49 +4,50 @@
 
 package docs.http.scaladsl
 
-import akka.http.scaladsl.model.{ HttpRequest, HttpResponse }
+import akka.http.impl.util.ExampleHttpContexts
+import akka.http.scaladsl.model.{ HttpRequest, HttpResponse, StatusCodes }
+import akka.stream.ActorMaterializer
 
-//#bindAndHandleAsync
+//#bindAndHandleSecure
 import scala.concurrent.Future
 
-import akka.http.scaladsl.{ Http, HttpsConnectionContext }
-//#bindAndHandleAsync
+import akka.http.scaladsl.HttpsConnectionContext
+//#bindAndHandleSecure
 
-//#bindAndHandleAsync
-//#bindAndHandleWithoutNegotiation
-import akka.http.scaladsl.Http2
-//#bindAndHandleWithoutNegotiation
+//#bindAndHandleSecure
+//#bindAndHandlePlain
+import akka.http.scaladsl.Http
+//#bindAndHandlePlain
 
-//#bindAndHandleAsync
+//#bindAndHandleSecure
 
-//#bindAndHandleWithoutNegotiation
+//#bindAndHandlePlain
 import akka.http.scaladsl.HttpConnectionContext
-import akka.http.scaladsl.UseHttp2.Always
 
-//#bindAndHandleWithoutNegotiation
+//#bindAndHandlePlain
 
 import akka.actor.ActorSystem
 import akka.stream.Materializer
 
 object Http2Spec {
-  val asyncHandler: HttpRequest => Future[HttpResponse] = ???
-  val httpsServerContext: HttpsConnectionContext = ???
-  implicit val system: ActorSystem = ???
-  implicit val materializer: Materializer = ???
+  val asyncHandler: HttpRequest => Future[HttpResponse] = _ => Future.successful(HttpResponse(status = StatusCodes.ImATeapot))
+  val httpsServerContext: HttpsConnectionContext = ExampleHttpContexts.exampleServerContext
+  implicit val system: ActorSystem = ActorSystem()
+  implicit val materializer: Materializer = ActorMaterializer()
 
-  //#bindAndHandleAsync
+  //#bindAndHandleSecure
   Http().bindAndHandleAsync(
     asyncHandler,
     interface = "localhost",
     port = 8443,
     httpsServerContext)
-  //#bindAndHandleAsync
+  //#bindAndHandleSecure
 
-  //#bindAndHandleWithoutNegotiation
-  Http2().bindAndHandleAsync(
+  //#bindAndHandlePlain
+  Http().bindAndHandleAsync(
     asyncHandler,
     interface = "localhost",
     port = 8080,
-    connectionContext = HttpConnectionContext(http2 = Always))
-  //#bindAndHandleWithoutNegotiation
+    connectionContext = HttpConnectionContext())
+  //#bindAndHandlePlain
 }

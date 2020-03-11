@@ -19,6 +19,11 @@ import akka.stream.scaladsl._
 import akka.stream.testkit.Utils.assertAllStagesStopped
 import akka.stream.testkit._
 import akka.stream.ActorMaterializer
+import akka.stream.Attributes
+import akka.stream.Outlet
+import akka.stream.SourceShape
+import akka.stream.stage.GraphStage
+import akka.stream.stage.GraphStageLogic
 import akka.testkit._
 import akka.util.ByteString
 import org.scalatest.Inside
@@ -29,11 +34,12 @@ import scala.reflect.ClassTag
 import scala.util.Random
 
 class HttpServerSpec extends AkkaSpec(
-  """akka.loggers = []
-     akka.loglevel = OFF
+  """akka.loggers = ["akka.http.impl.util.SilenceAllTestEventListener"]
+     akka.loglevel = DEBUG
+     akka.http.server.log-unencrypted-network-bytes = 100
      akka.http.server.request-timeout = infinite
      akka.scheduler.implementation = "akka.testkit.ExplicitlyTriggeredScheduler"
-  """) with Inside { spec =>
+  """) with Inside with WithLogCapturing { spec =>
   implicit val materializer = ActorMaterializer()
 
   "The server implementation" should {
@@ -353,6 +359,8 @@ class HttpServerSpec extends AkkaSpec(
     })
 
     "close the connection if request entity stream has been cancelled" in assertAllStagesStopped(new TestSetup {
+      override def settings: ServerSettings = super.settings.mapTimeouts(_.withLingerTimeout(10.millis))
+
       // two chunks sent by client
       send("""POST / HTTP/1.1
              |Host: example.com
@@ -376,6 +384,7 @@ class HttpServerSpec extends AkkaSpec(
           dataProbe.expectNext(Chunk(ByteString("abcdef")))
           dataProbe.expectComplete()
           // connection closes once requested elements are consumed
+          scheduler.timePasses(100.millis) // > lingerTimeout to trigger delay cancellation
           netIn.expectCancellation()
       }
       shutdownBlueprint()
@@ -416,7 +425,7 @@ class HttpServerSpec extends AkkaSpec(
           dataProbe.expectNext(ByteString("abcdef"))
           dataProbe.expectNoMessage(50.millis)
           closeNetworkInput()
-          dataProbe.expectError().getMessage shouldEqual "Entity stream truncation"
+          dataProbe.expectError().getMessage shouldEqual "Entity stream truncation. The HTTP parser was receiving an entity when the underlying connection was closed unexpectedly."
       }
       shutdownBlueprint()
     })
@@ -438,7 +447,7 @@ class HttpServerSpec extends AkkaSpec(
           dataProbe.expectNext(Chunk(ByteString("abcdef")))
           dataProbe.expectNoMessage(50.millis)
           closeNetworkInput()
-          dataProbe.expectError().getMessage shouldEqual "Entity stream truncation"
+          dataProbe.expectError().getMessage shouldEqual "Entity stream truncation. The HTTP parser was receiving an entity when the underlying connection was closed unexpectedly."
       }
       shutdownBlueprint()
     })
@@ -799,6 +808,76 @@ class HttpServerSpec extends AkkaSpec(
           |
           |""")
 
+      netIn.sendComplete()
+      netOut.expectComplete()
+    })
+    "log error and reset connection when the response stream fails" in assertAllStagesStopped(new TestSetup {
+      override def settings: ServerSettings = super.settings.mapTimeouts(_.withLingerTimeout(10.millis))
+
+      send("""POST /inject-meteor HTTP/1.1
+             |Host: example.com
+             |
+             |""".stripMarginWithNewline("\r\n"))
+
+      expectRequest()
+
+      val dataOutProbe = TestPublisher.probe[ByteString]()
+      val outEntity = HttpEntity.Chunked.fromData(ContentTypes.`application/octet-stream`, Source.fromPublisher(dataOutProbe))
+
+      responses.sendNext(HttpResponse(entity = outEntity))
+      expectResponseWithWipedDate(
+        """HTTP/1.1 200 OK
+          |Server: akka-http/test
+          |Date: XXXX
+          |Transfer-Encoding: chunked
+          |Content-Type: application/octet-stream
+          |
+          |""")
+      dataOutProbe.sendNext(ByteString("Hello"))
+      netOut.expectUtf8EncodedString("5\r\nHello\r\n")
+
+      EventFilter.error("Response stream for [POST /inject-meteor] failed with 'Meteor wiped data center'. Aborting connection.", occurrences = 1).intercept {
+        dataOutProbe.sendError(new RuntimeException("Meteor wiped data center"))
+      }
+
+      netOut.expectError()
+      scheduler.timePasses(100.millis) // > lingerTimeout to trigger delay cancellation
+      netIn.expectCancellation()
+    })
+    "log error and reset connection when the response stream materialization fails" in assertAllStagesStopped(new TestSetup {
+      override def settings: ServerSettings = super.settings.mapTimeouts(_.withLingerTimeout(10.millis))
+
+      send("""POST /recharge-banana HTTP/1.1
+             |Host: example.com
+             |
+             |""".stripMarginWithNewline("\r\n"))
+
+      expectRequest()
+
+      object FailingSource extends GraphStage[SourceShape[Nothing]] {
+        val out = Outlet[Nothing]("nonono")
+        override def shape: SourceShape[Nothing] = SourceShape(out)
+        override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+          throw new RuntimeException("Banana recharging not (yet) supported")
+      }
+      val bananaCharger = Source.fromGraph(FailingSource)
+
+      val outEntity = HttpEntity.Chunked.fromData(ContentTypes.`application/octet-stream`, bananaCharger)
+
+      EventFilter.error("Rendering of response failed because response entity stream materialization failed with 'Banana recharging not (yet) supported'. Sending out 500 response instead.", occurrences = 1).intercept {
+        responses.sendNext(HttpResponse(entity = outEntity))
+      }
+
+      expectResponseWithWipedDate(
+        """HTTP/1.1 500 Internal Server Error
+          |Server: akka-http/test
+          |Date: XXXX
+          |Content-Type: text/plain; charset=UTF-8
+          |Content-Length: 35
+          |
+          |There was an internal server error.""")
+
+      scheduler.timePasses(100.millis) // > lingerTimeout to trigger delay cancellation
       netIn.sendComplete()
       netOut.expectComplete()
     })
@@ -1172,17 +1251,20 @@ class HttpServerSpec extends AkkaSpec(
           def expectDefaultEntityWithSizeError(limit: Int, actualSize: Int) =
             inside(request) {
               case HttpRequest(POST, _, _, entity @ HttpEntity.Default(_, `actualSize`, _), _) =>
-                val error = the[Exception]
-                  .thrownBy(entity.dataBytes.runFold(ByteString.empty)(_ ++ _).awaitResult(100.millis.dilated))
-                  .getCause
+                val origError = the[Exception]
+                  .thrownBy(entity.dataBytes.runFold(ByteString.empty)(_ ++ _).awaitResult(3.seconds.dilated))
+
+                log.error(origError, "Original Error")
+                val error = origError.getCause
+
                 error shouldEqual EntityStreamSizeException(limit, Some(actualSize))
-                error.getMessage should include("exceeded content length limit")
+                error.getMessage should include("exceeded size limit")
 
                 responses.expectRequest()
                 responses.sendError(error.asInstanceOf[Exception])
 
                 expectResponseWithWipedDate(
-                  s"""HTTP/1.1 413 Request Entity Too Large
+                  s"""HTTP/1.1 413 Payload Too Large
                       |Server: akka-http/test
                       |Date: XXXX
                       |Connection: close
@@ -1195,17 +1277,19 @@ class HttpServerSpec extends AkkaSpec(
           def expectChunkedEntityWithSizeError(limit: Int) =
             inside(request) {
               case HttpRequest(POST, _, _, entity: HttpEntity.Chunked, _) =>
-                val error = the[Exception]
-                  .thrownBy(entity.dataBytes.runFold(ByteString.empty)(_ ++ _).awaitResult(100.millis.dilated))
-                  .getCause
+                val origError = the[Exception]
+                  .thrownBy(entity.dataBytes.runFold(ByteString.empty)(_ ++ _).awaitResult(3.seconds.dilated))
+
+                log.error(origError, "Original Error")
+                val error = origError.getCause
                 error shouldEqual EntityStreamSizeException(limit, None)
-                error.getMessage should include("exceeded content length limit")
+                error.getMessage should include("exceeded size limit")
 
                 responses.expectRequest()
                 responses.sendError(error.asInstanceOf[Exception])
 
                 expectResponseWithWipedDate(
-                  s"""HTTP/1.1 413 Request Entity Too Large
+                  s"""HTTP/1.1 413 Payload Too Large
                     |Server: akka-http/test
                     |Date: XXXX
                     |Connection: close

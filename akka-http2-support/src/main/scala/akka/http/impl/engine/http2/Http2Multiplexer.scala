@@ -12,8 +12,8 @@ import scala.collection.mutable
 import scala.collection.immutable
 import akka.stream.stage.{ GraphStageLogic, InHandler, OutHandler, StageLogging }
 import akka.util.ByteString
-
 import FrameEvent._
+import akka.http.scaladsl.settings.Http2ServerSettings
 
 /**
  * INTERNAL API
@@ -33,15 +33,34 @@ private[http2] trait Http2Multiplexer {
   def updatePriority(priorityFrame: PriorityFrame): Unit
 
   def reportTimings(): Unit
+
+  /** Called to cleanup any state when the connection is torn down */
+  def shutdown(): Unit
 }
 
 /**
  * INTERNAL API
  *
- * The current default multiplexer.
+ * Multiplexes the outgoing side of the streams on a HTTP/2 connection.
+ * Accepts the streams from the Akka HTTP side and turns them into `FrameEvent`s
+ * to be passed to the network side.
+ *
+ * Mixed into the Http2ServerDemux graph logic.
  */
 @InternalApi
 private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with StageLogging =>
+  def settings: Http2ServerSettings
+
+  /**
+   * Signal an outgoing stream has ended, so when the incoming side is also finished it can be cleaned up.
+   */
+  def handleOutgoingEnded(streamId: Int): Unit
+
+  /**
+   * Allows suspending reading of incoming frames.
+   */
+  def allowReadingIncomingFrames(allow: Boolean): Unit
+
   def createMultiplexer(outlet: GenericOutlet[FrameEvent], prioritizer: StreamPrioritizer): Http2Multiplexer =
     new Http2Multiplexer with OutHandler with StateTimingSupport with LogSupport { self =>
       outlet.setHandler(this)
@@ -112,6 +131,7 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
           trailer = None
           maybeInlet.foreach(_.cancel())
           self.closeStream(this)
+          handleOutgoingEnded(streamId)
 
           if (maybeInlet.isDefined) {
             maybeInlet = None
@@ -218,10 +238,7 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
       def enqueueOutStream(outStream: OutStream): Unit = state.enqueueOutStream(outStream)
       def closeStream(outStream: OutStream): Unit = state.closeStream(outStream)
 
-      override def onDownstreamFinish(): Unit = {
-        outStreams.values.foreach(_.cancelStream())
-        completeStage()
-      }
+      override def shutdown(): Unit = outStreams.values.foreach(_.cancelStream())
 
       var state: MultiplexerState = Idle
       def onPull(): Unit = state.onPull()
@@ -250,7 +267,7 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
 
       private[http2] case object Idle extends MultiplexerState {
         def onPull(): Unit = become(WaitingForData)
-        def pushControlFrame(frame: FrameEvent): Unit = become(WaitingForNetworkToSendControlFrames(frame :: Nil, immutable.TreeSet.empty))
+        def pushControlFrame(frame: FrameEvent): Unit = become(WaitingForNetworkToSendControlFrames(Vector(frame), immutable.TreeSet.empty))
         def connectionWindowAvailable(): Unit = ()
         def enqueueOutStream(outStream: OutStream): Unit = become(WaitingForNetworkToSendData(immutable.TreeSet(outStream.streamId)))
         def closeStream(outStream: OutStream): Unit = ()
@@ -279,11 +296,13 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
       }
 
       /** Not yet pulled but data waiting to be sent */
-      private[http2] case class WaitingForNetworkToSendControlFrames(controlFrameBuffer: immutable.Seq[FrameEvent], sendableOutstreams: immutable.Set[Int]) extends MultiplexerState {
+      private[http2] case class WaitingForNetworkToSendControlFrames(controlFrameBuffer: immutable.Vector[FrameEvent], sendableOutstreams: immutable.Set[Int]) extends MultiplexerState {
         require(controlFrameBuffer.nonEmpty)
+        allowReadingIncomingFrames(controlFrameBuffer.size < settings.outgoingControlFrameBufferSize)
         def onPull(): Unit = controlFrameBuffer match {
           case first +: remaining =>
             outlet.push(first)
+            allowReadingIncomingFrames(remaining.size < settings.outgoingControlFrameBufferSize)
             become {
               if (remaining.isEmpty && sendableOutstreams.isEmpty) Idle
               else if (remaining.isEmpty) WaitingForNetworkToSendData(sendableOutstreams)
@@ -337,7 +356,7 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
           else // do nothing and wait for window first
             become(WaitingForConnectionWindow(sendableOutstreams))
 
-        def pushControlFrame(frame: FrameEvent): Unit = become(WaitingForNetworkToSendControlFrames(frame :: Nil, sendableOutstreams))
+        def pushControlFrame(frame: FrameEvent): Unit = become(WaitingForNetworkToSendControlFrames(Vector(frame), sendableOutstreams))
         def connectionWindowAvailable(): Unit = ()
         def enqueueOutStream(outStream: OutStream): Unit =
           if (!sendableOutstreams.contains(outStream.streamId))
@@ -370,7 +389,7 @@ private[http2] trait Http2MultiplexerSupport { logic: GraphStageLogic with Stage
 
       def nextStateAfterPushingDataFrame(outStream: OutStream, sendableOutstreams: Set[Int]): MultiplexerState = {
         outStream.endStreamIfPossible()
-          .map(finalFrame => WaitingForNetworkToSendControlFrames(immutable.Seq(finalFrame), sendableOutstreams - outStream.streamId))
+          .map(finalFrame => WaitingForNetworkToSendControlFrames(Vector(finalFrame), sendableOutstreams - outStream.streamId))
           .getOrElse {
             val newSendableOutStreams =
               if (outStream.canSend) sendableOutstreams + outStream.streamId

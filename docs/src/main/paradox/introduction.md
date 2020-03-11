@@ -1,5 +1,7 @@
 # 1. Introduction
 
+@@project-info{ projectId="akka-http" }
+
 The Akka HTTP modules implement a full server- and client-side HTTP stack on top of *akka-actor* and *akka-stream*. It's
 not a web-framework but rather a more general toolkit for providing and consuming HTTP-based services. While interaction
 with a browser is of course also in scope it is not the primary focus of Akka HTTP.
@@ -67,31 +69,34 @@ configured using the [Giter8](http://www.foundweekends.org/giter8/) template:
 
 @@@ div { .group-scala }
 ```sh
-sbt -Dsbt.version=0.13.15 new https://github.com/akka/akka-http-scala-seed.g8
+sbt -Dsbt.version=0.13.15 new https://github.com/akka/akka-http-quickstart-scala.g8
 ```
 @@@
 @@@ div { .group-java }
 ```sh
-sbt -Dsbt.version=0.13.15 new https://github.com/akka/akka-http-java-seed.g8
+sbt -Dsbt.version=0.13.15 new https://github.com/akka/akka-http-quickstart-java.g8
 ```
 From there on the prepared project can be built using Gradle or Maven.
 @@@
 
 More instructions can be found on the @scala[[template
-project](https://github.com/akka/akka-http-scala-seed.g8)]@java[[template
-project](https://github.com/akka/akka-http-java-seed.g8)].
+project](https://github.com/akka/akka-http-quickstart-scala.g8)]@java[[template
+project](https://github.com/akka/akka-http-quickstart-java.g8)].
 
 ## Routing DSL for HTTP servers
 
 The high-level, routing API of Akka HTTP provides a DSL to describe HTTP "routes" and how they should be handled.
-Each route is composed of one or more level of `Directive` s that narrows down to handling one specific type of
+Each route is composed of one or more level of @apidoc[Directives] that narrows down to handling one specific type of
 request.
 
 For example one route might start with matching the `path` of the request, only matching if it is "/hello", then
 narrowing it down to only handle HTTP `get` requests and then `complete` those with a string literal, which
 will be sent back as a HTTP OK with the string as response body.
 
-The @scala[@scaladoc[Route](akka.http.scaladsl.server.index#Route=akka.http.scaladsl.server.RequestContext=%3Escala.concurrent.Future[akka.http.scaladsl.server.RouteResult])]@java[@apidoc[Route]] created using the Route DSL is then "bound" to a port to start serving HTTP requests:
+The
+@scala[@scaladoc[Route](akka.http.scaladsl.server.index#Route=akka.http.scaladsl.server.RequestContext=%3Escala.concurrent.Future[akka.http.scaladsl.server.RouteResult])]
+@java[@javadoc[Route](akka.http.scaladsl.server.Route)]
+created using the Route DSL is then "bound" to a port to start serving HTTP requests:
 
 Scala
 :   @@snip [HttpServerExampleSpec.scala]($test$/scala/docs/http/scaladsl/HttpServerExampleSpec.scala) { #minimal-routing-example }
@@ -122,7 +127,7 @@ for details):
 
 @@@
 @@@ div { .group-java }
-JSON support is possible in `akka-http` by the use of Jackson, an external artifact (see @ref[JSON Support](common/json-support.md#json-jackson-support-java)
+JSON support is possible in `akka-http` by the use of Jackson, an external artifact (see @ref[JSON Support](common/json-support.md#jackson-support)
 for details):
 
 @@dependency [sbt,Gradle,Maven] {
@@ -148,7 +153,7 @@ When you run this server, you can update the inventory via `curl -H "Content-Typ
 via `curl http://localhost:8080/item/42`.
 
 The logic for the marshalling and unmarshalling JSON in this example is provided by the @scala["spray-json"]@java["Jackson"] library
-(details on how to use that here: @scala[@ref[JSON Support](common/json-support.md))]@java[@ref[JSON Support](common/json-support.md#json-jackson-support-java))].
+(details on how to use that here: @scala[@ref[JSON Support](common/json-support.md))]@java[@ref[JSON Support](common/json-support.md#jackson-support))].
 
 ## Streaming
 
@@ -170,7 +175,7 @@ Connecting to this service with a slow HTTP client would backpressure so that th
 demand with constant memory usage on the server. This can be seen using curl and limiting the rate
 `curl --limit-rate 50b 127.0.0.1:8080/random`
 
-Akka HTTP routes easily interacts with actors. In this example one route allows for placing bids in a fire-and-forget
+Akka HTTP routes easily interact with actors. In this example one route allows for placing bids in a fire-and-forget
 style while the second route contains a request-response interaction with an actor. The resulting response is rendered
 as json and returned when the response arrives from the actor.
 
@@ -180,7 +185,7 @@ Scala
 Java
 :   @@snip [HttpServerActorInteractionExample.java]($test$/java/docs/http/javadsl/HttpServerActorInteractionExample.java) { #actor-interaction }
 
-When you run this server, you can add an auction bid via `curl -X PUT http://localhost:8080/auction?bid=22&user=MartinO` on the terminal; and then you can view the auction status either in a browser, at the url [http://localhost:8080/auction](http://localhost:8080/auction), or, on the terminal, via `curl http://localhost:8080/auction`.
+When you run this server, you can add an auction bid via `curl -X PUT "http://localhost:8080/auction?bid=22&user=MartinO"` on the terminal; and then you can view the auction status either in a browser, at the url [http://localhost:8080/auction](http://localhost:8080/auction), or, on the terminal, via `curl http://localhost:8080/auction`.
 
 More details on how JSON marshalling and unmarshalling works can be found in the @ref[JSON Support section](common/json-support.md).
 

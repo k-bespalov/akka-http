@@ -31,18 +31,6 @@ inThisBuild(Def.settings(
   //  test in assembly := {},
   licenses := Seq("Apache-2.0" -> url("https://opensource.org/licenses/Apache-2.0")),
   description := "Akka Http: Modern, fast, asynchronous, streaming-first HTTP server and client.",
-  scalacOptions ++= Seq(
-    "-deprecation",
-    "-encoding", "UTF-8", // yes, this is 2 args
-    "-unchecked",
-    "-Xlint",
-    // "-Yno-adapted-args", //akka-http heavily depends on adapted args and => Unit implicits break otherwise
-    "-Ywarn-dead-code"
-    // "-Xfuture" // breaks => Unit implicits
-  ),
-  javacOptions ++= Seq(
-    "-encoding", "UTF-8"
-  ),
   testOptions += Tests.Argument(TestFrameworks.JUnit, "-q", "-v"),
   Dependencies.Versions,
   Formatting.formatSettings,
@@ -69,11 +57,13 @@ lazy val root = Project(
       // We currently expect the java documentation at akka-http/target/javaunidoc, so
       // the following heuristic is hopefully good enough to determine which one is the Java and
       // which one the Scala version.
+
+      // This will fail with a MatchError when -Dakka.genjavadoc.enabled is not set
       val (Seq(java), Seq(scala)) = unidocArtifacts.partition(_.getName contains "java")
 
       Seq(
-        scala -> s"www/api/akka-http/${version.value}",
-        java -> s"www/japi/akka-http/${version.value}")
+        scala -> gustavDir("api").value,
+        java -> gustavDir("japi").value)
     }
   )
   .aggregate(
@@ -87,7 +77,8 @@ lazy val root = Project(
     httpTests,
     httpMarshallersScala,
     httpMarshallersJava,
-    docs
+    docs,
+    compatibilityTests
   )
 
 /**
@@ -130,7 +121,7 @@ lazy val parsing = project("akka-parsing")
   .addAkkaModuleDependency("akka-actor", "provided")
   .settings(Dependencies.parsing)
   .settings(
-    scalacOptions := scalacOptions.value.filterNot(Set("-Xfatal-warnings", "-Xlint", "-Ywarn-dead-code").contains), // disable warnings for parboiled code
+    scalacOptions --= Seq("-Xfatal-warnings", "-Xlint", "-Ywarn-dead-code"), // disable warnings for parboiled code
     scalacOptions += "-language:_",
     unmanagedSourceDirectories in ScalariformKeys.format in Test := (unmanagedSourceDirectories in Test).value
   )
@@ -144,6 +135,13 @@ lazy val httpCore = project("akka-http-core")
   .dependsOn(parsing)
   .addAkkaModuleDependency("akka-stream", "provided")
   .addAkkaModuleDependency("akka-stream-testkit", "test")
+  .addAkkaModuleDependency(
+    "akka-stream-testkit",
+    "test",
+    shouldUseSourceDependency = true,
+    uri("git://github.com/akka/akka.git#master"),
+    onlyIf = System.getProperty("akka.http.test-against-akka-master", "false") == "true"
+  )
   .settings(Dependencies.httpCore)
   .settings(VersionGenerator.versionSettings)
   .settings(scalaMacroSupport)
@@ -160,6 +158,13 @@ lazy val http = project("akka-http")
   )
   .settings(scalaMacroSupport)
   .enablePlugins(BootstrapGenjavadoc, BoilerplatePlugin)
+
+def gustavDir(kind: String) = Def.task {
+  val ver =
+    if (isSnapshot.value) "snapshot"
+    else version.value
+  s"www/$kind/akka-http/$ver"
+}
 
 lazy val http2Support = project("akka-http2-support")
   .settings(commonSettings)
@@ -306,6 +311,7 @@ lazy val docs = project("docs")
   .enablePlugins(AkkaParadoxPlugin, NoPublish, DeployRsync)
   .disablePlugins(BintrayPlugin, MimaPlugin)
   .addAkkaModuleDependency("akka-stream", "provided")
+  .addAkkaModuleDependency("akka-actor-typed", "provided")
   .dependsOn(
     httpCore, http, httpXml, http2Support, httpMarshallersJava, httpMarshallersScala, httpCaching,
     httpTests % "compile;test->test", httpTestkit % "compile;test->test"
@@ -353,8 +359,24 @@ lazy val docs = project("docs")
     apidocRootPackage := "akka",
     Formatting.docFormatSettings,
     additionalTasks in ValidatePR += paradox in Compile,
-    deployRsyncArtifact := List((paradox in Compile).value -> s"www/docs/akka-http/${version.value}")
+    deployRsyncArtifact := List((paradox in Compile).value -> gustavDir("docs").value),
   )
   .settings(ParadoxSupport.paradoxWithCustomDirectives)
+
+lazy val compatibilityTests = Project("akka-http-compatibility-tests", file("akka-http-compatibility-tests"))
+  .enablePlugins(NoPublish)
+  .disablePlugins(BintrayPlugin, MimaPlugin)
+  .addAkkaModuleDependency("akka-stream", "provided")
+  .settings(
+    libraryDependencies ++= Seq(
+      "com.typesafe.akka" %% "akka-http" % MiMa.latestVersion % "provided",
+    ),
+    (dependencyClasspath in Test) := {
+      // HACK: We'd like to use `dependsOn(http % "test->compile")` to upgrade the explicit dependency above to the
+      //       current version but that fails. So, this is a manual `dependsOn` which works as expected.
+      (dependencyClasspath in Test).value.filterNot(_.data.getName contains "akka") ++
+      (fullClasspath in (httpTests, Test)).value
+    }
+  )
 
 def hasCommitsAfterTag(description: Option[GitDescribeOutput]): Boolean = description.get.commitSuffix.distance > 0

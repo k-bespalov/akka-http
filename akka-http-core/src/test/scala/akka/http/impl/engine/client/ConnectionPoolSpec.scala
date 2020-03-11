@@ -10,6 +10,7 @@ import java.nio.channels.{ ServerSocketChannel, SocketChannel }
 import java.util.concurrent.atomic.AtomicInteger
 
 import akka.actor.ActorSystem
+import akka.event.Logging
 import akka.http.impl.engine.client.PoolMasterActor.PoolInterfaceRunning
 import akka.http.impl.engine.server.ServerTerminator
 import akka.http.impl.engine.ws.ByteStringSinkProbe
@@ -20,7 +21,8 @@ import akka.http.scaladsl.model.{ HttpEntity, _ }
 import akka.http.scaladsl.model.headers._
 import akka.http.scaladsl.settings.{ ClientConnectionSettings, ConnectionPoolSettings, PoolImplementation, ServerSettings }
 import akka.http.scaladsl.{ ClientTransport, ConnectionContext, Http }
-import akka.stream.{ ActorMaterializer, OverflowStrategy, QueueOfferResult }
+import akka.stream.Attributes
+import akka.stream.{ OverflowStrategy, QueueOfferResult }
 import akka.stream.TLSProtocol._
 import akka.stream.scaladsl._
 import akka.stream.testkit.Utils.TE
@@ -34,16 +36,14 @@ import scala.concurrent.duration._
 import scala.util.control.NonFatal
 import scala.util.{ Failure, Success, Try }
 
-abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extends AkkaSpec("""
-    akka.loglevel = DEBUG
-    akka.loggers = ["akka.http.impl.util.SilenceAllTestEventListener"]
+abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation)
+  extends AkkaSpecWithMaterializer("""
     akka.io.tcp.windows-connection-abort-workaround-enabled = auto
     akka.io.tcp.trace-logging = off
     akka.test.single-expect-default = 5000 # timeout for checks, adjust as necessary, set here to 5s
     akka.scheduler.tick-duration = 1ms     # to make race conditions in Pool idle-timeout more likely
     akka.http.client.log-unencrypted-network-bytes = 200
-                                          """) with WithLogCapturing { testSuite =>
-  implicit val materializer = ActorMaterializer()
+                                          """) { testSuite =>
 
   // FIXME: Extract into proper util class to be reusable
   lazy val ConnectionResetByPeerMessage: String = {
@@ -199,14 +199,15 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
       responses mustContainLike { case (Failure(x), 43) => x.getMessage should include(ConnectionResetByPeerMessage) }
     }
 
-    // akka-http/#416
     "surface connection-level and stream-level errors while receiving response entity" in new TestSetup(autoAccept = true) {
+
       val errorOnConnection1 = Promise[ByteString]()
 
       val crashingEntity =
         Source.fromIterator(() => Iterator.fill(10)(ByteString("abc")))
           .concat(Source.fromFuture(errorOnConnection1.future))
-          .log("test")
+          .log("response-entity-stream")
+          .addAttributes(Attributes.logLevels(Logging.InfoLevel, Logging.InfoLevel, Logging.InfoLevel))
 
       val laterHandler = Promise[(HttpRequest => Future[HttpResponse]) => Unit]()
 
@@ -239,10 +240,13 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
       // ensure that server has seen request 2
       val handlerSetter = Await.result(laterHandler.future, 1.second.dilated)
 
-      // now fail the first one
-      EventFilter[RuntimeException](occurrences = 1) intercept {
-        errorOnConnection1.failure(new RuntimeException)
+      // now fail the first one, expecting the server-side error message
+      EventFilter[RuntimeException](message = "Response stream for [GET /a] failed with 'Woops, slipped on a slippery slope.'. Aborting connection.", occurrences = 1) intercept {
+        errorOnConnection1.failure(new RuntimeException("Woops, slipped on a slippery slope."))
       }
+
+      // expect "reset by peer" on the client side
+      probe1.expectError()
 
       // waiting for error to trigger connection pool failure
       Thread.sleep(2000)
@@ -260,7 +264,8 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
       requestIn.sendNext(HttpRequest(uri = "/crash") -> 43)
       responseOutSub.request(2)
 
-      val remainingResponsesToKill = new AtomicInteger(1)
+      // must be lazy to prevent initialization problem because `mapServerSideOutboundRawBytes` might be called before the value is initialized
+      lazy val remainingResponsesToKill = new AtomicInteger(1)
       override def mapServerSideOutboundRawBytes(bytes: ByteString): ByteString =
         if (bytes.utf8String.contains("/crash") && remainingResponsesToKill.decrementAndGet() >= 0)
           sys.error("CRASH BOOM BANG")
@@ -283,7 +288,8 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
       requestIn.sendNext(HttpRequest(uri = "/crash") -> 43)
       responseOutSub.request(2)
 
-      val remainingResponsesToKill = new AtomicInteger(5)
+      // must be lazy to prevent initialization problem because `mapServerSideOutboundRawBytes` might be called before the value is initialized
+      lazy val remainingResponsesToKill = new AtomicInteger(5)
       override def mapServerSideOutboundRawBytes(bytes: ByteString): ByteString =
         if (bytes.utf8String.contains("/crash") && remainingResponsesToKill.decrementAndGet() >= 0)
           sys.error("CRASH BOOM BANG")
@@ -301,6 +307,41 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
       val gateway = hcp.gateway
       Await.result(gateway.poolStatus(), 1500.millis.dilated).get shouldBe a[PoolInterfaceRunning]
       awaitCond({ Await.result(gateway.poolStatus(), 1500.millis.dilated).isEmpty }, 2000.millis.dilated)
+    }
+    "automatically shutdown after configured timeout periods but only after streaming response is finished" in new TestSetup() {
+      val (requestIn, responseOut, responseOutSub, hcp) = cachedHostConnectionPool[Int](idleTimeout = 200.millis)
+      val gateway = hcp.gateway
+
+      lazy val responseEntityPub = TestPublisher.probe[ByteString]()
+
+      override def testServerHandler(connNr: Int): HttpRequest => HttpResponse = {
+        case request @ HttpRequest(_, Uri.Path("/a"), _, _, _) =>
+          val entity = HttpEntity.Chunked.fromData(ContentTypes.`text/plain(UTF-8)`, Source.fromPublisher(responseEntityPub))
+          super.testServerHandler(connNr)(request) withEntity entity
+        case x => super.testServerHandler(connNr)(x)
+      }
+      requestIn.sendNext(HttpRequest(uri = "/a") -> 42)
+      responseOutSub.request(1)
+      acceptIncomingConnection()
+      val (Success(r1), 42) = responseOut.expectNext()
+      val responseEntityProbe = ByteStringSinkProbe()
+      r1.entity.dataBytes.runWith(responseEntityProbe.sink)
+      responseEntityPub.sendNext(ByteString("Hello"))
+      responseEntityProbe.expectUtf8EncodedString("Hello")
+
+      Await.result(gateway.poolStatus(), 1500.millis.dilated).get shouldBe a[PoolInterfaceRunning]
+      Thread.sleep(500)
+
+      // afterwards it should still be running because a response is still being delivered
+      responseEntityPub.sendNext(ByteString("World"))
+      responseEntityProbe.expectUtf8EncodedString("World")
+      Await.result(gateway.poolStatus(), 1500.millis.dilated).get shouldBe a[PoolInterfaceRunning]
+
+      // now finish response
+      responseEntityPub.sendComplete()
+      responseEntityProbe.request(1)
+      responseEntityProbe.expectComplete()
+      awaitCond(Await.result(gateway.poolStatus(), 1500.millis.dilated).isEmpty, 2000.millis.dilated)
     }
 
     "transparently restart after idle shutdown" in new TestSetup() {
@@ -582,7 +623,6 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
   class TestSetup(
     serverSettings: ServerSettings = ServerSettings(system),
     autoAccept:     Boolean        = false) {
-    val (serverHostName, serverPort) = SocketUtil.temporaryServerHostnameAndPort()
 
     def asyncTestServerHandler(connNr: Int): HttpRequest => Future[HttpResponse] = {
       val handler = testServerHandler(connNr)
@@ -600,25 +640,33 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
 
     val incomingConnectionCounter = new AtomicInteger
     val incomingConnections = TestSubscriber.manualProbe[Http.IncomingConnection]
-    val incomingConnectionsSub = {
+    val (incomingConnectionsSub, serverHostName: String, serverPort: Int) = {
       val rawBytesInjection = BidiFlow.fromFlows(
         Flow[SslTlsOutbound].collect[ByteString] { case SendBytes(x) => mapServerSideOutboundRawBytes(x) }
           .recover({ case NoErrorComplete => ByteString.empty }),
         Flow[ByteString].map(SessionBytes(null, _)))
       val sink = if (autoAccept) Sink.foreach[Http.IncomingConnection](handleConnection) else Sink.fromSubscriber(incomingConnections)
-      Tcp().bind(serverHostName, serverPort, idleTimeout = serverSettings.timeouts.idleTimeout)
-        .map { c =>
-          val layer = Http().serverLayer(serverSettings, log = log)
-          val flow = (layer atop rawBytesInjection join c.flow)
-            .mapMaterializedValue(_ =>
-              new ServerTerminator {
-                // this is simply a mock, since we do not use termination in these tests anyway
-                def terminate(deadline: FiniteDuration)(implicit ec: ExecutionContext): Future[HttpTerminated] =
-                  Future.successful(HttpServerTerminated)
-              })
-          Http.IncomingConnection(c.localAddress, c.remoteAddress, flow)
-        }.runWith(sink)
-      if (autoAccept) null else incomingConnections.expectSubscription()
+
+      val binding =
+        Tcp()
+          .bind("localhost", 0, idleTimeout = serverSettings.timeouts.idleTimeout)
+          .map { c =>
+            val layer = Http().serverLayer(serverSettings, log = log)
+            val flow = (layer atop rawBytesInjection join c.flow)
+              .mapMaterializedValue(_ =>
+                new ServerTerminator {
+                  // this is simply a mock, since we do not use termination in these tests anyway
+                  def terminate(deadline: FiniteDuration)(implicit ec: ExecutionContext): Future[HttpTerminated] =
+                    Future.successful(HttpServerTerminated)
+                })
+            Http.IncomingConnection(c.localAddress, c.remoteAddress, flow)
+          }
+          .to(sink)
+          .run()
+          .awaitResult(3.seconds)
+
+      val sub = if (autoAccept) null else incomingConnections.expectSubscription()
+      (sub, binding.localAddress.getHostString, binding.localAddress.getPort)
     }
 
     def acceptIncomingConnection(): Unit = {
@@ -715,7 +763,7 @@ abstract class ConnectionPoolSpec(poolImplementation: PoolImplementation) extend
 
   implicit class MustContain[T](specimen: Seq[T]) {
     def mustContainLike(pf: PartialFunction[T, Unit]): Unit =
-      specimen.collectFirst(pf) getOrElse fail("did not contain")
+      specimen.collectFirst(pf) getOrElse fail(s"None of [${specimen.mkString(", ")}] matched partial function")
   }
 
   object NoErrorComplete extends SingletonException

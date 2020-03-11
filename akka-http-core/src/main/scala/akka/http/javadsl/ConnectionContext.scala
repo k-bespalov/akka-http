@@ -39,8 +39,7 @@ object ConnectionContext {
       OptionConverters.toScala(enabledCipherSuites).map(Util.immutableSeq(_)),
       OptionConverters.toScala(enabledProtocols).map(Util.immutableSeq(_)),
       OptionConverters.toScala(clientAuth),
-      OptionConverters.toScala(sslParameters),
-      scaladsl.UseHttp2.Negotiated)
+      OptionConverters.toScala(sslParameters))
 
   /** Used to serve HTTPS traffic. */
   // for binary-compatibility, since 2.4.7
@@ -56,8 +55,7 @@ object ConnectionContext {
       OptionConverters.toScala(enabledCipherSuites).map(Util.immutableSeq(_)),
       OptionConverters.toScala(enabledProtocols).map(Util.immutableSeq(_)),
       OptionConverters.toScala(clientAuth),
-      OptionConverters.toScala(sslParameters),
-      scaladsl.UseHttp2.Negotiated)
+      OptionConverters.toScala(sslParameters))
 
   /** Used to serve HTTP traffic. */
   def noEncryption(): HttpConnectionContext =
@@ -68,29 +66,22 @@ object ConnectionContext {
 abstract class ConnectionContext {
   def isSecure: Boolean
   def sslConfig: Option[AkkaSSLConfig]
-  def http2: UseHttp2
-
-  def withHttp2(newValue: UseHttp2): ConnectionContext
 
   @deprecated("'default-http-port' and 'default-https-port' configuration properties are used instead", since = "10.0.11")
   def getDefaultPort: Int
 }
 
 @DoNotInherit
-abstract class HttpConnectionContext(override val http2: UseHttp2) extends akka.http.javadsl.ConnectionContext {
+abstract class HttpConnectionContext extends akka.http.javadsl.ConnectionContext {
   override final def isSecure = false
   override final def getDefaultPort = 80
   override def sslConfig: Option[AkkaSSLConfig] = None
-
-  override def withHttp2(newValue: UseHttp2): HttpConnectionContext
 }
 
 @DoNotInherit
-abstract class HttpsConnectionContext(override val http2: UseHttp2) extends akka.http.javadsl.ConnectionContext {
+abstract class HttpsConnectionContext extends akka.http.javadsl.ConnectionContext {
   override final def isSecure = true
   override final def getDefaultPort = 443
-
-  override def withHttp2(newValue: UseHttp2): HttpsConnectionContext
 
   /** Java API */
   def getEnabledCipherSuites: Optional[JCollection[String]]

@@ -14,9 +14,10 @@ object AkkaDependency {
   // else if akka version is "default", then the hard coded default will be used (jenkins doesn't allow empty values for config axis)
   // else if akka.version is anything else, then the given version will be used
 
-  val defaultAkkaVersion = "2.5.22"
+  // Updated only when needed, https://github.com/akka/akka/issues/26985
+  val defaultAkkaVersion = "2.5.26"
   val akkaVersion =
-    System.getProperty("akka.build.version", defaultAkkaVersion) match {
+    System.getProperty("akka.http.build.akka.version", defaultAkkaVersion) match {
       case "default" => defaultAkkaVersion
       case x => x
     }
@@ -43,22 +44,29 @@ object AkkaDependency {
 
   implicit class RichProject(project: Project) {
     /** Adds either a source or a binary dependency, depending on whether the above settings are set */
-    def addAkkaModuleDependency(module: String, config: String = ""): Project =
-      if (shouldUseSourceDependency) {
-        val moduleRef = ProjectRef(akkaRepository, module)
-        val withConfig: ClasspathDependency =
-          if (config == "") moduleRef
-          else moduleRef % config
+    def addAkkaModuleDependency(module: String,
+                                config: String = "",
+                                shouldUseSourceDependency: Boolean = AkkaDependency.shouldUseSourceDependency,
+                                akkaRepository: URI = AkkaDependency.akkaRepository,
+                                onlyIf: Boolean = true): Project =
+      if (onlyIf) {
+        if (shouldUseSourceDependency) {
+          val moduleRef = ProjectRef(akkaRepository, module)
+          val withConfig: ClasspathDependency =
+            if (config == "") moduleRef
+            else moduleRef % config
 
-        project.dependsOn(withConfig)
-      } else {
-        project.settings(libraryDependencies += {
-          val dep = "com.typesafe.akka" %% module % akkaVersion
-          val withConfig =
-            if (config == "") dep
-            else dep % config
-          withConfig
-        })
+          project.dependsOn(withConfig)
+        } else {
+          project.settings(libraryDependencies += {
+            val dep = "com.typesafe.akka" %% module % akkaVersion
+            val withConfig =
+              if (config == "") dep
+              else dep % config
+            withConfig
+          })
+        }
       }
+      else project // return unchanged
   }
 }

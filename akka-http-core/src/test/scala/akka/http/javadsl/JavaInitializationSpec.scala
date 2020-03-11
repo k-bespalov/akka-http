@@ -4,9 +4,10 @@
 
 package akka.http.javadsl
 
-import org.scalatest.{ Matchers, WordSpec }
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.wordspec.AnyWordSpec
 
-class JavaInitializationSpec extends WordSpec with Matchers {
+class JavaInitializationSpec extends AnyWordSpec with Matchers {
 
   implicit class HeaderCheck[T](self: T) {
     def =!=(expected: String) = {
@@ -31,8 +32,8 @@ class JavaInitializationSpec extends WordSpec with Matchers {
 
   "HttpEntity" should {
     "initializes the right field" in {
-      akka.http.scaladsl.model.HttpEntity.Empty =!= "HttpEntity.Strict(none/none,ByteString())"
-      akka.http.javadsl.model.HttpEntities.EMPTY =!= "HttpEntity.Strict(none/none,ByteString())"
+      akka.http.scaladsl.model.HttpEntity.Empty =!= "HttpEntity.Strict(none/none,0 bytes total)"
+      akka.http.javadsl.model.HttpEntities.EMPTY =!= "HttpEntity.Strict(none/none,0 bytes total)"
     }
   }
 
